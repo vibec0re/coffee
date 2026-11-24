@@ -48,9 +48,9 @@ container's mount table.
 ## CLI
 
 ```
-coffeefs serve NAME [-m MOUNTPOINT] [-s SOCKET] [--state FILE]
+coffeefs serve NAME [-m MOUNTPOINT] [-s SOCKET] [--state FILE] [--config FILE]...
                     [--link SRC[:DST]]... [--link-ro SRC[:DST]]... [--mkdir DIR]...
-                    [--pid PID | --mount-ns NSFILE] [--threads N] [--ttl SECS]
+                    [--pid PID | --mount-ns NSFILE] [--threads N] [--ttl SECS] [--retry SECS]
 coffeefs add   INSTANCE SOURCE [TARGET] [--ro] [--replace]
 coffeefs rm    INSTANCE TARGET [-r]
 coffeefs mkdir INSTANCE TARGET
@@ -62,8 +62,39 @@ coffeefs ls    INSTANCE [--json]
 `COFFEEFS_SOCKET_DIR`), or a path to a socket. The mountpoint defaults to
 `/containers/NAME`.
 
-With `--state FILE`, every change is saved atomically and replayed at startup.
-Links whose source has disappeared are skipped with a warning.
+### Config and runtime entries
+
+Entries come from two places, and `ls` says which with a `[config]` tag:
+
+- **Config**: `--config FILE`, `--link`, `--link-ro` and `--mkdir`. These are
+  declarative. They are set up first on every start and never written to the
+  state file, so taking one out of the config removes it.
+- **Runtime**: `add`, `mkdir` and `rm` over the socket. With `--state FILE`
+  they are saved after each change (fresh 0600 file, fsync, rename) and
+  replayed after the config at startup.
+
+A `--config` file uses the state file's format:
+
+```json
+[{"kind":"dir","target":"/tmp"},
+ {"kind":"link","source":"/srv/x","target":"/x","ro":true}]
+```
+
+`--link SRC:DST` splits at the last `:/`, so SRC may contain `:`. For paths
+that are stranger still, use `--config`.
+
+Startup doesn't fail just because an entry can't be applied. Such an entry
+becomes **pending**: `ls` shows it with the reason, it stays in the state
+file, and it is retried every `--retry` seconds (default 5) until it works
+or you `rm` it. This covers two cases:
+
+- The source isn't there yet, e.g. `/home` mounts after the daemon starts.
+- The entry conflicts with the config. The config wins, and the runtime entry
+  waits.
+
+A state file that can't be parsed is renamed to `NAME.corrupt-<time>`, and
+the instance starts without it. A state or config file that anyone other
+than root or the daemon's user could write is refused.
 
 ### Mounting into a running container
 
@@ -87,9 +118,11 @@ $ echo '{"op":"add","source":"/srv/x","target":"/x","ro":true}' | socat - UNIX:/
 ```
 
 Ops: `add {source,target,ro?,replace?}`, `rm {target,recursive?}`,
-`mkdir {target}`, `ls`. The socket is mode `0600`, and every connection is
-also checked with `SO_PEERCRED`: only root or the daemon's own user may
-connect.
+`mkdir {target}`, `ls`. `ls` returns `entries`, each a state-file entry plus
+`origin` (`config` or `runtime`) and, for pending ones, `pending` (the reason).
+
+The socket is mode `0600`, and every connection is also checked with
+`SO_PEERCRED`: only root or the daemon's own user may connect.
 
 ## NixOS
 
@@ -122,7 +155,9 @@ connect.
 ```
 
 Each instance becomes `coffeefs-NAME.service` (`Type=notify`,
-`Restart=on-failure`), with its state in `/var/lib/coffeefs/NAME.json`.
+`Restart=on-failure`). `links` and `dirs` are passed as a generated `--config`
+file, so removing one and rebuilding revokes it. Runtime changes are kept in
+`/var/lib/coffeefs/NAME.json` (`persist`, on by default).
 
 ## Security model
 

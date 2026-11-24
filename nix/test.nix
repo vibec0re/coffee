@@ -28,11 +28,26 @@ self:
         "d /srv/rw/team 0770 root team -"
         # setgid: new entries inherit the group (and dirs the bit)
         "d /srv/rw/sg 2777 root team -"
+        "d /srv/a:b 0755 root root -"
       ];
 
       services.coffeefs.instances = {
         # plain host mount, poked at directly from the host
-        plain.mountpoint = "/mnt/plain";
+        plain = {
+          mountpoint = "/mnt/plain";
+          dirs = [ "/cfgdir" ];
+          # ':' in the source: passed via the JSON config, nothing to split
+          links = [
+            {
+              source = "/srv/a:b";
+              target = "/colon";
+            }
+          ];
+          extraArgs = [
+            "--retry"
+            "0.5"
+          ];
+        };
 
         # host mount at /containers/choom1, bind-mounted into the container
         choom1 = {
@@ -85,6 +100,11 @@ self:
     def inside_fails(cmd):
         machine.fail(f"nixos-container run choom1 -- sh -c {shlex.quote(cmd)}")
 
+    def restart(unit="coffeefs-plain", verb="restart"):
+        # this test (re)starts units far more often than the start limit allows
+        machine.succeed(f"systemctl reset-failed {unit}; systemctl {verb} {unit}")
+        machine.wait_for_unit(f"{unit}.service")
+
     with subtest("ro and rw links, read-only skeleton"):
         machine.succeed("coffeefs add plain /srv/shared /s --ro")
         assert machine.succeed("cat /mnt/plain/s/hello.txt").strip() == "hello"
@@ -136,11 +156,48 @@ self:
         machine.succeed("cp -a /var/lib/coffeefs/plain.json /tmp/plain.json.bak")
         machine.succeed("chmod 666 /var/lib/coffeefs/plain.json")
         machine.fail("systemctl restart coffeefs-plain")
-        machine.succeed("journalctl -u coffeefs-plain | grep -q 'refusing a state file'")
+        machine.succeed("journalctl -u coffeefs-plain | grep -q 'refusing a file that others can write'")
         machine.succeed("cp -a /tmp/plain.json.bak /var/lib/coffeefs/plain.json")
-        machine.succeed("systemctl reset-failed coffeefs-plain; systemctl restart coffeefs-plain")
-        machine.wait_for_unit("coffeefs-plain.service")
+        restart()
         machine.succeed("grep -qx data /mnt/plain/rw/f")
+        # a corrupt one is moved aside instead of keeping the instance down
+        machine.succeed("echo '[{\"kind\":\"li' > /var/lib/coffeefs/plain.json")
+        restart()
+        machine.succeed("ls /var/lib/coffeefs/plain.corrupt-*")
+        machine.succeed("cp -a /tmp/plain.json.bak /var/lib/coffeefs/plain.json")
+        restart()
+        machine.succeed("grep -qx data /mnt/plain/rw/f")
+
+    with subtest("config entries: applied first, never persisted, config wins"):
+        machine.succeed("test -d /mnt/plain/cfgdir && test -d /mnt/plain/colon")
+        out = machine.succeed("coffeefs ls plain")
+        assert "/cfgdir/ [config]" in out, out
+        assert "/colon -> /srv/a:b [config]" in out, out
+        # so removing them from the NixOS config revokes them
+        machine.fail("grep -q cfgdir /var/lib/coffeefs/plain.json")
+        machine.fail("grep -q colon /var/lib/coffeefs/plain.json")
+        # a runtime change that conflicts with the config no longer
+        # restart-loops the instance: config wins, the change stays pending
+        machine.succeed("coffeefs add plain /srv/rw /cfgdir --replace")
+        restart()
+        machine.succeed("test -d /mnt/plain/cfgdir && test ! -e /mnt/plain/cfgdir/f")
+        out = machine.succeed("coffeefs ls plain")
+        assert "/cfgdir -> /srv/rw [pending: /cfgdir already exists]" in out, out
+        machine.succeed("coffeefs rm plain /cfgdir")
+        restart()
+        assert "pending" not in machine.succeed("coffeefs ls plain")
+
+    with subtest("a link whose source is missing at start is kept and retried"):
+        machine.succeed("mkdir -p /srv/late && echo late > /srv/late/f")
+        machine.succeed("coffeefs add plain /srv/late /late")
+        machine.succeed("systemctl stop coffeefs-plain && mv /srv/late /srv/late.away")
+        restart(verb="start")
+        machine.fail("test -e /mnt/plain/late")
+        assert "/late -> /srv/late [pending:" in machine.succeed("coffeefs ls plain")
+        machine.succeed("grep -q /srv/late /var/lib/coffeefs/plain.json")
+        machine.succeed("mv /srv/late.away /srv/late")
+        machine.wait_until_succeeds("grep -qx late /mnt/plain/late/f", timeout=10)
+        assert "pending" not in machine.succeed("coffeefs ls plain")
 
     with subtest("removal invalidates kernel caches, open files survive"):
         machine.succeed("ls /mnt/plain/s >/dev/null")
@@ -171,10 +228,9 @@ self:
         machine.fail("su alice -c 'coffeefs ls /run/coffeefs/plain.sock'")
 
     with subtest("links survive restart and crash"):
-        machine.succeed("systemctl restart coffeefs-plain")
-        machine.wait_for_unit("coffeefs-plain.service")
+        restart()
         machine.succeed("grep -qx hello /mnt/plain/etc/greeting")
-        machine.succeed("systemctl kill -s KILL coffeefs-plain")
+        machine.succeed("systemctl reset-failed coffeefs-plain; systemctl kill -s KILL coffeefs-plain")
         machine.wait_until_succeeds("grep -qx hello /mnt/plain/etc/greeting", timeout=30)
 
     with subtest("container sees the host mount via its bind mount"):
@@ -205,8 +261,7 @@ self:
         inside("mountpoint -q /coffee")
         machine.fail("mountpoint -q /coffee")
         inside_fails("touch /coffee/data/x")
-        machine.succeed("systemctl restart coffeefs-choom1ns")
-        machine.wait_for_unit("coffeefs-choom1ns.service")
+        restart("coffeefs-choom1ns")
         machine.wait_until_succeeds("nixos-container run choom1 -- cat /coffee/data/hello.txt", timeout=30)
         assert inside("grep -c ' /coffee ' /proc/mounts").strip() == "1"
   '';

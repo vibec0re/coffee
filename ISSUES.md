@@ -1,177 +1,98 @@
 # Issues
 
-Open issues from the code review of `6fecac6`, ordered by severity. Each one
-was confirmed by reading the code. Fixed issues keep their numbers and are
-listed at the end.
+This started as the code review of `6fecac6`, plus a Code Climate-style
+check. #1–#14 are fixed (see the end), and each fix has unit tests and, where
+the kernel or systemd is involved, a subtest in the NixOS VM test. The
+remaining items are open.
 
-## Correctness
+## Open
 
-### 4. A link whose source is temporarily missing is lost for good (high)
+### 15. Symlinks in a mountpoint's parent directories are followed (low)
 
-`load()` skips entries whose source can't be opened (`src/ctl.rs:211`). Any
-later `save()` writes the state without them. That later save is either the
-startup `--mkdir`/`--link` replay, which `handle()` saves after, or the next
-runtime `add`/`rm`.
+What's fixed (#2): missing parents are created 0755, and a mountpoint that is
+itself a symlink is refused.
 
-**Impact:** if the daemon starts before `/home`, ZFS or a network mount is
-available, every runtime-added link on that filesystem is silently dropped.
+What's left: a symlink in a pre-existing ancestor is still followed. It can
+only be planted if an admin created that ancestor writable for others.
 
-**Fix:** keep entries that fail to load in a "pending" list. Write them back
-on save, and show them in `ls` marked as unavailable. Optionally retry them
-later, or when asked to over the control socket.
+**Fix:** mount through the new mount API: `fsopen("fuse")` and `fsmount`,
+then `move_mount` onto an `openat2(RESOLVE_NO_SYMLINKS)` fd. In a foreign
+namespace this also avoids `/proc/self` (which isn't usable after `setns`).
 
-### 5. A conflict between the config and the state file causes a restart loop (medium)
+### 16. `rm` removes a live entry and a pending one at the same target (low)
 
-The state file is loaded first. Then `--mkdir`/`--link` are applied, and
-any error aborts `serve()` (`src/main.rs:296-312`). Combined with
-`Restart=on-failure`, the instance never comes up.
+Suppose a runtime entry is pending because it conflicts with a config entry
+at the same target. `rm TARGET` removes both. After a restart the config
+entry comes back, but until then it's gone.
 
-**Examples:**
-- `dirs = ["/x"]` in the config, plus a later `coffeefs add inst /srv /x --replace`
-  that was persisted. On restart, `--mkdir /x` fails with "/x is a link".
-- `--link src:/a` while the state has links under `/a` fails with "/a is a
-  non-empty directory".
+**Fix:** an `rm --pending` flag (or `"pending":true` in the request) that only
+drops the pending entry.
 
-**Fix:** apply config entries first and the state file second. If the state
-file conflicts with config entries, the config wins and the conflicting state
-entry is logged and kept as pending (see #4). Never fail startup over a
-conflict.
+### 17. `tests.rs` is long (low)
 
-### 6. Removing a link from the NixOS config doesn't revoke it (medium)
+The file is 1055 lines. Ten tests are over 25 lines, and the setup code
+(controller with a state file, `fs::write` + `chmod 600`) repeats.
 
-With `persist = true` (the default), links from the config are saved into the
-state file like runtime links, then replayed on every start
-(`nix/module.nix:119-122`).
+**Fix:** a small fixture, `Inst::new(config)`, holding the controller, the
+state path and a host dir, then split the file by area (`core`, `ctl`, `perm`).
 
-**Impact:** an admin deletes a link from `services.coffeefs.instances.X.links`
-and rebuilds, but the container keeps access.
+## Code climate
 
-**Fix:** record where each entry came from (`config` or `runtime`), and
-persist only `runtime` entries. Config entries come from argv on every start.
-`ls` can show which is which.
-
-### 7. A corrupt state file blocks startup (low)
-
-`save()` now fsyncs the file and its directory (fixed together with #1), so a
-crash should no longer leave a truncated `NAME.json`. A corrupt file from any
-other cause still makes `load()` fail, `serve()` exit 1, and systemd
-restart-loop the instance until someone deletes the file.
-
-**Fix:** on a parse error, move the bad file aside as `NAME.json.corrupt` and
-start empty (logged loudly) instead of refusing to start.
-
-### 8. `fsyncdir` is a no-op (medium)
-
-`fsyncdir` replies OK without doing anything (`src/fs.rs:348`), and
-`Core::fsync` does the same for `Handle::Dir` (`src/core.rs:849`). An
-application that does write, fsync, rename, then fsync on the directory is
-told the rename is durable, but it isn't.
-
-**Fix:** keep a real directory fd in `DirState` (or reopen the O_PATH fd with
-`O_RDONLY|O_DIRECTORY`) and `fsync` it. Virtual dirs can stay a no-op.
-
-### 9. `--link SRC:DST` splits at the first `:` (low)
-
-`split_link` (`src/main.rs:128`) splits on the first `:`, so
-`/srv/a:b:/x` becomes source `/srv/a` and target `b:/x`. The NixOS module
-builds this argument from paths it doesn't validate (`nix/module.nix:124`).
-
-**Fix:** have the module pass source and target as two separate arguments
-(`--link SRC DST`, `num_args = 2`), or split at the last `:` and document that
-targets can't contain `:`. Add an assertion in the module either way.
-
-## Cleanup (code climate)
-
-This is a Code Climate-style check of `6fecac6`, against Code Climate's
-default maintainability thresholds:
-
-| Check | Limit |
-|---|---|
-| Lines per function | 25 |
-| Lines per file | 250 |
-| Cognitive complexity | 5 |
-| Arguments | 4 |
-| Returns | 4 |
-| Methods | 20 |
-| Nesting | 4 |
-
-Neither Code Climate nor qlty is in nixpkgs, so it was emulated:
+The same check as before:
 - **Metrics:** `rust-code-analysis-cli`.
-- **Duplication:** `jscpd`.
-- **Lints:** `clippy::pedantic`.
+- **Lints:** clippy pedantic.
+- **Thresholds:** Code Climate's defaults.
 
-| File | Grade | Why |
+| | `6fecac6` | now |
 |---|---|---|
-| `core.rs` | **D** | 1193 code lines. `impl Core` has 49 methods, 11 functions are over the complexity limit (max 18) and 13 are over 25 lines (max 95). |
-| `main.rs` | C | `serve` is 161 lines with complexity 12. |
-| `fs.rs` | B | 25 copies of `Err(e) => reply.error(err(e))`. The argument counts and size come from fuser's trait. |
-| `ctl.rs` | B | Just under the file limit. `load`, `serve` and `serve_conn` have complexity 6–7. |
-| `sys.rs`, `mount.rs` | A | |
-| `tests.rs` | C | Long tests and repeated setup. |
+| Max cognitive complexity | 18 (`setattr`) | 8 |
+| Functions over complexity 5 | 15 | 13, all 6–8 |
+| Longest function | 161 lines (`serve`) | 59 lines (`serve`, straight-line setup) |
+| `add_link` | 95 lines, complexity 14 | 47 lines, complexity 8 |
+| Largest non-trait file | `core.rs`, 1193 lines | `core/mod.rs`, 340 lines |
+| Copies of the reply error arm in `fs.rs` | 25 | 0 |
+| `unreachable!()` after typed lookups | 7 | 0 |
+| Pedantic warnings (non-test) | 56 | about 30, all numeric casts at the FFI boundary or by-value args |
 
-There is no nesting over 3 and no condition with more than 3 boolean
-operators. Plain clippy is clean. Pedantic gives 56 warnings in non-test
-code, all style.
+What changed:
+- `core.rs` is now `core/`:
+  - `mod.rs`: types, the inode table and lookup.
+  - `tree.rs`: the skeleton and the control plane, with one `walk` plus
+    `attach`/`unhook`.
+  - `ns.rs`: namespace ops, with one `make` helper and a `Caller` for
+    owner + umask.
+  - `io.rs`: typed handles, so `file()` returns `Arc<File>`, plus the split
+    listing code.
+  - `attr.rs`: `setattr` split into helpers.
+  - `xattr.rs`: separate read and write paths.
+- The other splits:
+  - `ctl.rs` became `ctl/` (controller, and `socket`).
+  - `sys.rs` became `sys/` (wrappers, and `creds`).
+  - `main.rs` became `main.rs` (CLI) plus `serve.rs`.
 
-`adopt()` and the creation argument lists were flagged too, but #3 has since
-removed `adopt()`.
-
-### 10. The tree walk is implemented three times in `core.rs` (M)
-
-The walk exists in `ensure_dirs`, `add_link` and `remove`, with the "is a
-link" message copied word for word. Virtual and real node construction is
-also copied, and the invalidation pairs are built three times. `ensure_dirs`
-never uses `self` (`clippy::unused_self`).
-
-**Fix:** move one `walk` helper, the node constructors and an attach-and-
-invalidate helper onto `State`. That should take `add_link` from 95 to
-about 40 lines.
-
-### 11. Handle access isn't typed (S)
-
-`let Handle::File(f) = &*h else { unreachable!() }` follows `file()` five
-times. `setxattr`/`removexattr` add two more `unreachable!()`s, because
-`xattr_target` returns an `Option` even for writes (complexity 14). `RealRef`
-is built by hand in both `get()` and `lookup()`.
-
-**Fix:** have `file()` return `Arc<File>`, split `xattr_target` into a read
-version and a write version, and add `From<&Real> for RealRef`.
-
-### 12. `setattr` and `snapshot` are too complex (S)
-
-`setattr` has cognitive complexity 18 and `snapshot` 14.
-
-**Fix:**
-- Split `setattr` into owner, mode, size and times helpers, and take
-  `&SetAttr`.
-- Split `snapshot` into a virtual half and a real half.
-
-### 13. `fs.rs` repeats its reply boilerplate (S)
-
-**Fix:** add a reply helper (a trait over `Res<T>` per reply type) to remove
-about 25 match blocks.
-
-### 14. `main.rs::serve` is 161 lines (M)
-
-**Fix:** split it into resolving paths, pre-populating, mounting and waiting
-for exit. Mounting also contains a duplicate: the `/dev/fuse` and
-`Session::from_fd` lines are repeated for the namespace and host-root cases.
+What's still above the thresholds, and why:
+- `fs.rs` (442 code lines, 34 callbacks) is shaped by fuser's `Filesystem`
+  trait.
+- `Core::create` has 5 arguments: FUSE create carries both mode and flags.
+- The `sys` wrappers mirror their syscalls' arguments.
 
 ## Limitations / future work
 
 These are the caveats listed in the README, plus a few design limits.
 
-- **No POSIX ACL enforcement.** The kernel checks mode bits only. Possible fix:
-  combined with #3's per-thread credentials, drop `default_permissions` and
-  let the host kernel check permissions as the caller.
+- **No POSIX ACL enforcement.** The kernel checks mode bits only. Now that
+  objects are created as the caller (#3), the next step could be: drop
+  `default_permissions`, switch the full credentials (including supplementary
+  groups) per request, and let the host kernel check permissions and ACLs as
+  the caller.
 - **Restarting a host-mode instance kills the container's bind mount.** The
   container sees `ENOTCONN` until it restarts. `inContainerNamespace` avoids
   this. Possible fix: hand the `/dev/fuse` fd to systemd's fd store
   (`FDSTORE=1`) and pick the session back up on restart.
 - **All I/O goes through the daemon.** Kernel FUSE passthrough (Linux 6.9+,
   `FUSE_PASSTHROUGH` with backing fds) would let reads and writes skip the
-  daemon for files opened rw or ro.
-- **One O_PATH fd per inode the kernel holds.** Very large trees can hit
+  daemon.
+- **One `O_PATH` fd per inode the kernel holds.** Very large trees can hit
   `RLIMIT_NOFILE`. Set `LimitNOFILE` in the module, or switch to file handles
   (`name_to_handle_at`/`open_by_handle_at`) like virtiofsd.
 - **No uid mapping.** Owners are passed through 1:1. That's fine for nspawn
@@ -185,65 +106,54 @@ These are the caveats listed in the README, plus a few design limits.
 
 ## Fixed
 
-### 1. State file was world-writable (critical)
+### Security
 
-The daemon ran with a process-wide `umask(0)`, so `save()` created `NAME.json`
-as 0666. Any local user could add a link, and the root daemon would replay it
-on the next start.
+- **#1 State file was world-writable (critical).** The process-wide
+  `umask(0)` made `NAME.json` 0666, so any local user could add a link that
+  the root daemon replayed.
+  - Now the process umask is 022, and only FUSE workers use a private umask
+    of 0 (`unshare(CLONE_FS)`).
+  - The state file is written fresh with `O_EXCL` and mode 0600.
+  - State and config files that anyone other than root or the daemon's user
+    could write are refused.
+- **#2 Mountpoints were created 0777 (high).** Same cause. Now they're
+  created 0755, a symlinked mountpoint is refused, and stale-mount handling
+  uses `lstat` and `UMOUNT_NOFOLLOW`. What's left is #15.
+- **#3 Ownership of new entries could be stolen through a race (high).** The
+  daemon created as root, then chowned whatever the name resolved to. Now
+  `sys::AsCaller` switches the worker thread's fsuid/fsgid (plus
+  `CAP_DAC_OVERRIDE`) for the creating syscall only. The kernel sets owner,
+  group and setgid inheritance, and nothing is chowned.
 
-**Fixed:**
-- The process umask is now 022. Only FUSE worker threads switch to a private
-  umask of 0, via `unshare(CLONE_FS)`, while they create on behalf of a
-  request.
-- `save()` removes any leftover `NAME.tmp`, then writes a fresh 0600 file with
-  `O_EXCL` (so it never follows a planted symlink), fsyncs it, renames it and
-  fsyncs the directory.
-- `load()` refuses a state file that isn't owned by the daemon's user or that
-  group/others can write, instead of replaying it.
+### Correctness
 
-Tests:
-- Unit: `state_file_is_private_and_written_fresh`,
-  `state_file_writable_by_others_is_refused`.
-- VM: "daemon's own files are not world-writable".
+- **#4 A link whose source was missing at start was lost for good (high).**
+  Such entries are now kept as *pending*: listed by `ls` with the reason,
+  saved in the state file, and retried every `--retry` seconds (default 5).
+- **#5 A config/state conflict caused a restart loop (medium).** The config
+  is now applied first and the state second, and nothing fails startup. A
+  conflicting state entry becomes pending (config wins).
+- **#6 Removing a link from the NixOS config didn't revoke it (medium).**
+  Config entries (`--config`, `--link`, `--mkdir`) are never written to the
+  state file, and `ls` tags them `[config]`. State files from older versions
+  that hold config entries are handled.
+- **#7 A crash during `save()` could block startup (medium).** `save()` now
+  fsyncs the file and its directory. A state file that can't be parsed
+  (including a truncated one) is moved to `NAME.corrupt-<time>`, and the
+  instance starts without it.
+- **#8 `fsyncdir` was a no-op (medium).** It now fsyncs the host directory.
+- **#9 `--link SRC:DST` split at the first `:` (low).** It now splits at the
+  last `:/`. The NixOS module no longer builds these strings at all: it
+  passes a generated JSON `--config` file.
 
-### 2. Mountpoints and their parents were created 0777 (high)
+### Cleanup (code climate)
 
-This had the same umask root cause as #1.
-
-**Fixed:**
-- `mount::prepare_mountpoint` creates missing dirs as 0755 and refuses a
-  mountpoint that is a symlink.
-- Stale-mount detection uses `lstat`, and lazy unmount passes
-  `UMOUNT_NOFOLLOW`.
-
-**Remaining risk:** symlinks in ancestor directories are still followed. They
-can only be planted if an admin pre-created a writable ancestor. Mounting
-through the new mount API (`fsmount` + `move_mount` onto an
-`openat2(RESOLVE_NO_SYMLINKS)` fd) would close that too.
-
-Tests:
-- Unit: `mountpoints_are_created_0755_and_symlinks_refused`.
-- VM: `/containers` is 755.
-
-### 3. Ownership of new entries could be stolen through a race (high)
-
-The daemon created entries as root, then reopened them **by name** and chowned
-whatever it found.
-
-**Fixed:** `adopt()` is gone. `sys::AsCaller` switches the worker thread's
-fsuid/fsgid to the caller for the creating syscall only: mkdir, mknod,
-symlink, and `O_CREAT` open. It then raises `CAP_DAC_OVERRIDE` in that
-thread, because the kernel already checked access under `default_permissions`
-and the thread lacks the caller's supplementary groups. The host kernel now
-sets owner, group (including setgid inheritance) and mode, so nothing is
-chowned. The name is still re-resolved to register the new inode, but that is
-read-only, the same as a lookup.
-
-This also fixes a side effect of the old approach: `mkdir` with S_ISGID in
-the mode used to set the bit by chmod. Linux ignores it, and so do we now.
-
-Tests:
-- Unit: `created_objects_get_the_requested_mode_whatever_the_process_umask`.
-- VM: "objects are created as the caller, not chowned afterwards". It covers
-  the caller's umask, fifos and symlinks, a supplementary-group-only dir, and
-  setgid inheritance.
+- **#10** The tree walk existed three times. It's now one `State::walk`,
+  plus `ensure_dirs`, `attach` and `unhook`.
+- **#11** Handles are typed, `RealRef` has `From<&Real>`, and xattrs have
+  separate read and write paths. The `unreachable!()`s are gone.
+- **#12** `setattr` and `snapshot` were split into helpers.
+- **#13** In `fs.rs`, the reply helpers (`send`, `empty`, `entry`, …) replace
+  25 copied error arms.
+- **#14** `serve` was split into `Instance::resolve`, `config_entries`,
+  `mount_session` and `run_until_signal`, in `serve.rs`.

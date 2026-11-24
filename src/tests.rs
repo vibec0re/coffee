@@ -3,7 +3,7 @@
 //! side is covered by the NixOS VM test in nix/test.nix.
 
 use crate::core::*;
-use crate::ctl::{self, Controller, NoInval, Request};
+use crate::ctl::{self, Controller, Entry, NoInval, Origin, Request};
 use fuser::{FileAttr, FileType, Owner};
 use std::ffi::OsStr;
 use std::fs;
@@ -19,6 +19,15 @@ fn me() -> Owner {
     Owner {
         uid: nix::unistd::geteuid().as_raw(),
         gid: nix::unistd::getegid().as_raw(),
+    }
+}
+
+fn caller(umask: u32) -> Caller {
+    let o = me();
+    Caller {
+        uid: o.uid,
+        gid: o.gid,
+        umask,
     }
 }
 
@@ -198,28 +207,28 @@ fn ro_link_rejects_every_write() {
     assert_eq!(c.open(file, libc::O_RDWR), Err(libc::EROFS));
     assert_eq!(c.open(file, RD | libc::O_TRUNC), Err(libc::EROFS));
     assert_eq!(
-        c.create(dir, os("n"), 0o644, 0, WR, me()).err(),
+        c.create(dir, os("n"), 0o644, WR, caller(0)).err(),
         Some(libc::EROFS)
     );
     assert_eq!(
-        c.mkdir(dir, os("d"), 0o755, 0, me()).err(),
+        c.mkdir(dir, os("d"), 0o755, caller(0)).err(),
         Some(libc::EROFS)
     );
     assert_eq!(c.unlink(dir, os("a.txt")), Err(libc::EROFS));
     assert_eq!(c.rmdir(dir, os("sub")), Err(libc::EROFS));
     assert_eq!(
-        c.rename(dir, os("a.txt"), dir, os("z"), 0),
+        c.rename((dir, os("a.txt")), (dir, os("z")), 0),
         Err(libc::EROFS)
     );
     assert_eq!(
-        c.symlink(dir, os("l"), Path::new("x"), me()).err(),
+        c.symlink(dir, os("l"), Path::new("x"), caller(0)).err(),
         Some(libc::EROFS)
     );
     let chmod = SetAttr {
         mode: Some(0o600),
         ..Default::default()
     };
-    assert_eq!(c.setattr(file, chmod, None).err(), Some(libc::EROFS));
+    assert_eq!(c.setattr(file, &chmod, None).err(), Some(libc::EROFS));
     assert_eq!(c.setxattr(file, os("user.x"), b"1", 0), Err(libc::EROFS));
 
     assert_eq!(read_all(&c, file), b"hello");
@@ -235,7 +244,7 @@ fn rw_link_passes_writes_through() {
 
     // create + write
     let (a, fh) = c
-        .create(dir, os("new.txt"), 0o664, 0o002, libc::O_RDWR, me())
+        .create(dir, os("new.txt"), 0o664, libc::O_RDWR, caller(0o002))
         .unwrap();
     assert_eq!(a.kind, FileType::RegularFile);
     assert_eq!(c.write(fh, 0, b"written").unwrap(), 7);
@@ -249,7 +258,9 @@ fn rw_link_passes_writes_through() {
     );
 
     // umask is honoured
-    let (_, fh) = c.create(dir, os("masked"), 0o666, 0o027, WR, me()).unwrap();
+    let (_, fh) = c
+        .create(dir, os("masked"), 0o666, WR, caller(0o027))
+        .unwrap();
     c.release(fh);
     assert_eq!(
         fs::metadata(h.path().join("masked"))
@@ -261,25 +272,23 @@ fn rw_link_passes_writes_through() {
     );
 
     // mkdir / symlink / readlink
-    let d = c.mkdir(dir, os("d"), 0o750, 0, me()).unwrap();
+    let d = c.mkdir(dir, os("d"), 0o750, caller(0)).unwrap();
     assert_eq!(d.kind, FileType::Directory);
     assert!(h.path().join("d").is_dir());
     let l = c
-        .symlink(dir, os("ln"), Path::new("new.txt"), me())
+        .symlink(dir, os("ln"), Path::new("new.txt"), caller(0))
         .unwrap();
     assert_eq!(l.kind, FileType::Symlink);
     assert_eq!(c.readlink(l.ino.0).unwrap(), b"new.txt");
 
     // rename + hardlink (same inode via both names)
-    c.rename(dir, os("new.txt"), d.ino.0, os("moved.txt"), 0)
+    c.rename((dir, os("new.txt")), (d.ino.0, os("moved.txt")), 0)
         .unwrap();
     assert!(h.path().join("d/moved.txt").exists());
     assert_eq!(
         c.rename(
-            dir,
-            os("a.txt"),
-            d.ino.0,
-            os("moved.txt"),
+            (dir, os("a.txt")),
+            (d.ino.0, os("moved.txt")),
             libc::RENAME_NOREPLACE
         ),
         Err(libc::EEXIST)
@@ -297,16 +306,16 @@ fn rw_link_passes_writes_through() {
         mtime: Some(TimeSpec::At(t)),
         ..Default::default()
     };
-    let after = c.setattr(moved.ino.0, sa, None).unwrap();
+    let after = c.setattr(moved.ino.0, &sa, None).unwrap();
     assert_eq!((after.size, after.perm, after.mtime), (3, 0o600, t));
     assert_eq!(fs::read_to_string(h.path().join("hard")).unwrap(), "wri");
 
     // fallocate/lseek/copy_file_range via handles
     let src = c.open(moved.ino.0, RD).unwrap();
     let (_, dst) = c
-        .create(dir, os("copy"), 0o644, 0, libc::O_RDWR, me())
+        .create(dir, os("copy"), 0o644, libc::O_RDWR, caller(0))
         .unwrap();
-    assert_eq!(c.copy_file_range(src, 0, dst, 0, 3, 0).unwrap(), 3);
+    assert_eq!(c.copy_file_range((src, 0), (dst, 0), 3, 0).unwrap(), 3);
     assert_eq!(c.read(dst, 0, 10).unwrap(), b"wri");
     assert_eq!(c.lseek(dst, 0, libc::SEEK_DATA).unwrap(), 0);
     c.release(src);
@@ -327,17 +336,17 @@ fn mknod_refuses_device_nodes() {
     add(&c, "/rw", h.path(), false);
     let dir = ino(&c, "/rw");
     assert_eq!(
-        c.mknod(dir, os("dev"), libc::S_IFCHR | 0o666, 0, me())
+        c.mknod(dir, os("dev"), libc::S_IFCHR | 0o666, caller(0))
             .err(),
         Some(libc::EPERM)
     );
     assert_eq!(
-        c.mknod(dir, os("blk"), libc::S_IFBLK | 0o666, 0, me())
+        c.mknod(dir, os("blk"), libc::S_IFBLK | 0o666, caller(0))
             .err(),
         Some(libc::EPERM)
     );
     let f = c
-        .mknod(dir, os("fifo"), libc::S_IFIFO | 0o600, 0, me())
+        .mknod(dir, os("fifo"), libc::S_IFIFO | 0o600, caller(0))
         .unwrap();
     assert_eq!(f.kind, FileType::NamedPipe);
 }
@@ -350,19 +359,19 @@ fn virtual_skeleton_is_read_only() {
     let work = ino(&c, "/work");
     for parent in [ROOT_INO, work] {
         assert_eq!(
-            c.create(parent, os("f"), 0o644, 0, WR, me()).err(),
+            c.create(parent, os("f"), 0o644, WR, caller(0)).err(),
             Some(libc::EROFS)
         );
         assert_eq!(
-            c.mkdir(parent, os("d"), 0o755, 0, me()).err(),
+            c.mkdir(parent, os("d"), 0o755, caller(0)).err(),
             Some(libc::EROFS)
         );
         assert_eq!(
-            c.symlink(parent, os("s"), Path::new("x"), me()).err(),
+            c.symlink(parent, os("s"), Path::new("x"), caller(0)).err(),
             Some(libc::EROFS)
         );
         assert_eq!(
-            c.mknod(parent, os("p"), libc::S_IFIFO | 0o644, 0, me())
+            c.mknod(parent, os("p"), libc::S_IFIFO | 0o644, caller(0))
                 .err(),
             Some(libc::EROFS)
         );
@@ -371,19 +380,19 @@ fn virtual_skeleton_is_read_only() {
     assert_eq!(c.rmdir(work, os("proj")), Err(libc::EROFS));
     assert_eq!(c.unlink(work, os("proj")), Err(libc::EROFS));
     assert_eq!(
-        c.rename(work, os("proj"), work, os("x"), 0),
+        c.rename((work, os("proj")), (work, os("x")), 0),
         Err(libc::EROFS)
     );
     let proj = ino(&c, "/work/proj");
     assert_eq!(
-        c.rename(proj, os("a.txt"), work, os("a.txt"), 0),
+        c.rename((proj, os("a.txt")), (work, os("a.txt")), 0),
         Err(libc::EROFS)
     );
     let chmod = SetAttr {
         mode: Some(0o777),
         ..Default::default()
     };
-    assert_eq!(c.setattr(work, chmod, None).err(), Some(libc::EROFS));
+    assert_eq!(c.setattr(work, &chmod, None).err(), Some(libc::EROFS));
 }
 
 #[test]
@@ -394,7 +403,7 @@ fn ops_across_links_are_exdev() {
     add(&c, "/two", h2.path(), false);
     let (one, two) = (ino(&c, "/one"), ino(&c, "/two"));
     assert_eq!(
-        c.rename(one, os("a.txt"), two, os("x"), 0),
+        c.rename((one, os("a.txt")), (two, os("x")), 0),
         Err(libc::EXDEV)
     );
     let a = ino(&c, "/one/a.txt");
@@ -446,7 +455,7 @@ fn symlinks_are_never_followed_on_the_host() {
     assert_eq!(c.open(ef.ino.0, RD), Err(libc::ELOOP));
     assert_eq!(c.open(ef.ino.0, WR | libc::O_TRUNC), Err(libc::ELOOP));
     assert_eq!(
-        c.create(dir, os("evilfile"), 0o644, 0, WR | libc::O_TRUNC, me())
+        c.create(dir, os("evilfile"), 0o644, WR | libc::O_TRUNC, caller(0))
             .err(),
         Some(libc::ELOOP)
     );
@@ -454,13 +463,13 @@ fn symlinks_are_never_followed_on_the_host() {
         size: Some(0),
         ..Default::default()
     };
-    assert_eq!(c.setattr(ef.ino.0, trunc, None).err(), Some(libc::EINVAL));
+    assert_eq!(c.setattr(ef.ino.0, &trunc, None).err(), Some(libc::EINVAL));
     let chmod = SetAttr {
         mode: Some(0o777),
         ..Default::default()
     };
     assert_eq!(
-        c.setattr(ef.ino.0, chmod, None).err(),
+        c.setattr(ef.ino.0, &chmod, None).err(),
         Some(libc::EOPNOTSUPP)
     );
     assert_eq!(
@@ -468,7 +477,7 @@ fn symlinks_are_never_followed_on_the_host() {
         Err(libc::EPERM)
     );
     assert_eq!(
-        c.mkdir(dir, os("evildir"), 0o755, 0, me()).err(),
+        c.mkdir(dir, os("evildir"), 0o755, caller(0)).err(),
         Some(libc::EEXIST)
     );
 
@@ -679,7 +688,7 @@ fn state_file_roundtrip() {
 
     let c2 = Arc::new(core());
     Controller::new(c2.clone(), Box::new(NoInval), Some(state.clone()))
-        .load()
+        .start(vec![])
         .unwrap();
     assert_eq!(c1.list(), c2.list());
     assert_eq!(read_all(&c2, ino(&c2, "/w/p/a.txt")), b"hello");
@@ -688,7 +697,7 @@ fn state_file_roundtrip() {
     fs::remove_file(h.path().join("a.txt")).unwrap();
     let c3 = Arc::new(core());
     Controller::new(c3.clone(), Box::new(NoInval), Some(state))
-        .load()
+        .start(vec![])
         .unwrap();
     assert_eq!(c3.list().len(), 2);
 }
@@ -745,7 +754,7 @@ fn control_socket_protocol() {
     assert_eq!(lines.next().unwrap().unwrap(), r#"{"ok":true}"#);
     assert_eq!(
         lines.next().unwrap().unwrap(),
-        r#"{"ok":true,"entries":[{"kind":"dir","target":"/m"}]}"#
+        r#"{"ok":true,"entries":[{"kind":"dir","target":"/m","origin":"runtime"}]}"#
     );
 
     // a second instance must not steal a live socket
@@ -783,10 +792,10 @@ fn created_objects_get_the_requested_mode_whatever_the_process_umask() {
     // a restrictive umask on the calling thread must not leak into objects
     // created for a request: the kernel already applied the caller's umask
     with_umask(0o077, || {
-        let (_, fh) = c.create(dir, os("f"), 0o666, 0o002, WR, me()).unwrap();
+        let (_, fh) = c.create(dir, os("f"), 0o666, WR, caller(0o002)).unwrap();
         c.release(fh);
-        c.mkdir(dir, os("d"), 0o1775, 0o002, me()).unwrap();
-        c.mknod(dir, os("p"), libc::S_IFIFO | 0o666, 0o022, me())
+        c.mkdir(dir, os("d"), 0o1775, caller(0o002)).unwrap();
+        c.mknod(dir, os("p"), libc::S_IFIFO | 0o666, caller(0o022))
             .unwrap();
     });
     assert_eq!(mode_of(&h.path().join("f")), 0o664);
@@ -820,7 +829,8 @@ fn state_file_writable_by_others_is_refused() {
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("s.json");
     fs::write(&state, r#"[{"kind":"dir","target":"/x"}]"#).unwrap();
-    let load = || Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone())).load();
+    let load =
+        || Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone())).start(vec![]);
     for bad in [0o666, 0o620, 0o602] {
         fs::set_permissions(&state, fs::Permissions::from_mode(bad)).unwrap();
         let e = load().unwrap_err();
@@ -844,4 +854,202 @@ fn mountpoints_are_created_0755_and_symlinks_refused() {
     symlink(dir.path(), &evil).unwrap();
     let e = crate::mount::prepare_mountpoint(&evil).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory);
+}
+
+fn ls(ctl: &Controller) -> Vec<Entry> {
+    ctl.handle(Request::Ls).entries.unwrap()
+}
+
+fn link(target: &str, source: &Path) -> ListEntry {
+    ListEntry::Link {
+        target: target.into(),
+        source: source.into(),
+        ro: false,
+    }
+}
+
+fn dir(target: &str) -> ListEntry {
+    ListEntry::Dir {
+        target: target.into(),
+    }
+}
+
+fn saved(state: &Path) -> Vec<ListEntry> {
+    serde_json::from_slice(&fs::read(state).unwrap()).unwrap()
+}
+
+#[test]
+fn config_entries_are_applied_first_and_never_persisted() {
+    let h = host();
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    let config = vec![dir("/cfg"), link("/cfglink", h.path())];
+    let ctl = |config: Vec<ListEntry>| {
+        let c = Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+        c.start(config).unwrap();
+        c
+    };
+
+    let c1 = ctl(config.clone());
+    c1.apply(Request::Add {
+        source: h.path().into(),
+        target: "/rt".into(),
+        ro: false,
+        replace: false,
+    })
+    .unwrap();
+    assert_eq!(saved(&state), vec![link("/rt", h.path())]);
+    let origins: Vec<_> = ls(&c1)
+        .iter()
+        .map(|e| (e.entry.clone(), e.origin))
+        .collect();
+    assert_eq!(
+        origins,
+        vec![
+            (dir("/cfg"), Origin::Config),
+            (link("/cfglink", h.path()), Origin::Config),
+            (link("/rt", h.path()), Origin::Runtime),
+        ]
+    );
+
+    // dropping an entry from the config revokes it on the next start
+    let c2 = ctl(vec![dir("/cfg")]);
+    let live: Vec<_> = ls(&c2).into_iter().map(|e| e.entry).collect();
+    assert_eq!(live, vec![dir("/cfg"), link("/rt", h.path())]);
+
+    // state files from older versions also hold config entries: no conflict
+    fs::write(
+        &state,
+        serde_json::to_vec(&[dir("/cfg"), link("/rt", h.path())]).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let c3 = ctl(vec![dir("/cfg")]);
+    assert!(ls(&c3).iter().all(|e| e.pending.is_none()));
+}
+
+#[test]
+fn conflicts_with_the_config_become_pending_instead_of_failing_startup() {
+    let h = host();
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    // runtime state that conflicts with what the config now says
+    fs::write(
+        &state,
+        serde_json::to_vec(&[link("/x", h.path()), link("/a/b", h.path())]).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+    c.start(vec![dir("/x"), link("/a", h.path())]).unwrap();
+
+    let entries = ls(&c);
+    let pending: Vec<_> = entries
+        .iter()
+        .filter_map(|e| Some((e.entry.target().to_owned(), e.pending.clone()?)))
+        .collect();
+    assert_eq!(pending.len(), 2, "{entries:?}");
+    assert!(pending[0].1.contains("already exists"), "{pending:?}");
+    assert!(pending[1].1.contains("is a link"), "{pending:?}");
+    // config won, and the runtime entries are kept for later
+    c.apply(Request::Mkdir {
+        target: "/other".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        saved(&state),
+        vec![dir("/other"), link("/x", h.path()), link("/a/b", h.path())]
+    );
+}
+
+#[test]
+fn unavailable_sources_stay_pending_and_are_retried() {
+    let base = TempDir::new().unwrap();
+    let src = base.path().join("late");
+    let away = base.path().join("away");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), "late").unwrap();
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    let new = || Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+
+    let c1 = new();
+    c1.start(vec![]).unwrap();
+    c1.apply(Request::Add {
+        source: src.clone(),
+        target: "/late".into(),
+        ro: false,
+        replace: false,
+    })
+    .unwrap();
+
+    // e.g. the filesystem holding the source isn't mounted yet at boot
+    fs::rename(&src, &away).unwrap();
+    let c2 = new();
+    c2.start(vec![]).unwrap();
+    let e = ls(&c2);
+    assert_eq!(e.len(), 1);
+    assert!(e[0].pending.as_deref().unwrap().contains("No such file"));
+    assert_eq!(c2.retry(), 0);
+    // other changes don't drop it from the state file
+    c2.apply(Request::Mkdir {
+        target: "/m".into(),
+    })
+    .unwrap();
+    assert_eq!(saved(&state), vec![dir("/m"), link("/late", &src)]);
+
+    fs::rename(&away, &src).unwrap();
+    assert_eq!(c2.retry(), 1);
+    assert!(ls(&c2).iter().all(|e| e.pending.is_none()));
+
+    // a pending entry can be removed like a live one
+    fs::rename(&src, &away).unwrap();
+    let c3 = new();
+    c3.start(vec![]).unwrap();
+    c3.apply(Request::Rm {
+        target: "/late".into(),
+        recursive: false,
+    })
+    .unwrap();
+    assert_eq!(saved(&state), vec![dir("/m")]);
+}
+
+#[test]
+fn corrupt_state_file_is_moved_aside() {
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    fs::write(&state, "[{\"kind\":\"li").unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+    c.start(vec![dir("/cfg")]).unwrap();
+    assert_eq!(ls(&c).len(), 1);
+    assert!(!state.exists());
+    let aside: Vec<_> = fs::read_dir(d.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(aside[0].starts_with("s.corrupt-"), "{aside:?}");
+}
+
+#[test]
+fn link_arguments_split_at_the_last_colon_slash() {
+    let l = |s| match crate::serve::parse_link(s, false).unwrap() {
+        ListEntry::Link { source, target, .. } => (source, target),
+        ListEntry::Dir { .. } => unreachable!(),
+    };
+    let p = PathBuf::from;
+    assert_eq!(l("/srv/a"), (p("/srv/a"), p("/srv/a")));
+    assert_eq!(l("/srv/a:/x"), (p("/srv/a"), p("/x")));
+    assert_eq!(l("/srv/a:b:/x"), (p("/srv/a:b"), p("/x")));
+    assert_eq!(l("/srv/a:b"), (p("/srv/a:b"), p("/srv/a:b")));
+}
+
+#[test]
+fn fsyncdir_syncs_host_dirs_and_ignores_virtual_ones() {
+    let h = host();
+    let c = core();
+    add(&c, "/v/p", h.path(), false);
+    c.fsyncdir(ino(&c, "/v"), false).unwrap();
+    c.fsyncdir(ino(&c, "/v/p"), true).unwrap();
+    c.fsyncdir(ino(&c, "/v/p/sub"), false).unwrap();
 }

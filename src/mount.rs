@@ -1,7 +1,7 @@
 //! Mounting straight into another process's mount namespace (e.g. a running
 //! container), while the daemon itself stays on the host.
 //!
-//! A helper thread gives itself a private fs_struct (`unshare(CLONE_FS)`),
+//! A helper thread gives itself a private `fs_struct` (`unshare(CLONE_FS)`),
 //! which is what allows `setns(CLONE_NEWNS)` in a multi-threaded process and
 //! confines the namespace switch to that one thread. It performs the mount
 //! there and exits; the FUSE connection lives on in our /dev/fuse fd.

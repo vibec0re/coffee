@@ -1,11 +1,13 @@
 //! fuser glue: translates FUSE requests into `Core` calls.
 
-use crate::core::{Core, SetAttr, TimeSpec};
+use crate::core::{Caller, Core, SetAttr, TimeSpec};
+use crate::sys::Res;
 use fuser::{
-    AccessFlags, CopyFileRangeFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, Owner, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen,
-    ReplyStatfs, ReplyStatx, ReplyWrite, ReplyXattr, Request, StatxMask, TimeOrNow, WriteFlags,
+    AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, Owner, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyStatx, ReplyWrite, ReplyXattr, Request, StatxMask, TimeOrNow,
+    WriteFlags,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -19,8 +21,75 @@ pub struct CoffeeFs {
 
 const GEN: Generation = Generation(0);
 
-fn err(e: i32) -> Errno {
-    Errno::from_i32(e)
+/// What every fuser reply type has in common.
+trait Fail {
+    fn fail(self, e: i32);
+}
+
+macro_rules! impl_fail {
+    ($($t:ty),*) => {
+        $(impl Fail for $t {
+            fn fail(self, e: i32) {
+                self.error(Errno::from_i32(e))
+            }
+        })*
+    };
+}
+
+impl_fail!(
+    ReplyAttr,
+    ReplyCreate,
+    ReplyData,
+    ReplyDirectory,
+    ReplyEmpty,
+    ReplyEntry,
+    ReplyLseek,
+    ReplyOpen,
+    ReplyStatfs,
+    ReplyWrite,
+    ReplyXattr
+);
+
+/// Answer with `ok(reply, value)`, or with the errno.
+fn send<R: Fail, T>(reply: R, r: Res<T>, ok: impl FnOnce(R, T)) {
+    match r {
+        Ok(v) => ok(reply, v),
+        Err(e) => reply.fail(e),
+    }
+}
+
+fn empty(reply: ReplyEmpty, r: Res<()>) {
+    send(reply, r, |r, ()| r.ok());
+}
+
+fn opened(reply: ReplyOpen, r: Res<u64>) {
+    send(reply, r, |r, fh| {
+        r.opened(FileHandle(fh), FopenFlags::empty());
+    });
+}
+
+fn data(reply: ReplyData, r: Res<Vec<u8>>) {
+    send(reply, r, |r, v| r.data(&v));
+}
+
+fn xattr(reply: ReplyXattr, r: Res<Vec<u8>>, size: u32) {
+    send(reply, r, |reply, v| {
+        if size == 0 {
+            reply.size(v.len() as u32);
+        } else if v.len() > size as usize {
+            reply.fail(libc::ERANGE);
+        } else {
+            reply.data(&v);
+        }
+    });
+}
+
+fn caller(owner: Owner, umask: u32) -> Caller {
+    Caller {
+        uid: owner.uid,
+        gid: owner.gid,
+        umask,
+    }
 }
 
 fn time(t: Option<TimeOrNow>) -> Option<TimeSpec> {
@@ -30,12 +99,13 @@ fn time(t: Option<TimeOrNow>) -> Option<TimeSpec> {
     })
 }
 
-fn xattr_reply(r: Result<Vec<u8>, i32>, size: u32, reply: ReplyXattr) {
-    match r {
-        Ok(v) if size == 0 => reply.size(v.len() as u32),
-        Ok(v) if v.len() > size as usize => reply.error(Errno::ERANGE),
-        Ok(v) => reply.data(&v),
-        Err(e) => reply.error(err(e)),
+impl CoffeeFs {
+    fn entry(&self, reply: ReplyEntry, r: Res<FileAttr>) {
+        send(reply, r, |r, a| r.entry(&self.ttl, &a, GEN));
+    }
+
+    fn attr(&self, reply: ReplyAttr, r: Res<FileAttr>) {
+        send(reply, r, |r, a| r.attr(&self.ttl, &a));
     }
 }
 
@@ -55,10 +125,7 @@ impl Filesystem for CoffeeFs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.core.lookup(parent.0, name) {
-            Ok(a) => reply.entry(&self.ttl, &a, GEN),
-            Err(e) => reply.error(err(e)),
-        }
+        self.entry(reply, self.core.lookup(parent.0, name));
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -66,10 +133,7 @@ impl Filesystem for CoffeeFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.core.getattr(ino.0) {
-            Ok(a) => reply.attr(&self.ttl, &a),
-            Err(e) => reply.error(err(e)),
-        }
+        self.attr(reply, self.core.getattr(ino.0));
     }
 
     fn statx(
@@ -112,17 +176,11 @@ impl Filesystem for CoffeeFs {
             atime: time(atime),
             mtime: time(mtime),
         };
-        match self.core.setattr(ino.0, a, fh.map(|f| f.0)) {
-            Ok(a) => reply.attr(&self.ttl, &a),
-            Err(e) => reply.error(err(e)),
-        }
+        self.attr(reply, self.core.setattr(ino.0, &a, fh.map(|f| f.0)));
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.core.readlink(ino.0) {
-            Ok(v) => reply.data(&v),
-            Err(e) => reply.error(err(e)),
-        }
+        data(reply, self.core.readlink(ino.0));
     }
 
     fn mknod(
@@ -136,10 +194,10 @@ impl Filesystem for CoffeeFs {
         owner: Owner,
         reply: ReplyEntry,
     ) {
-        match self.core.mknod(parent.0, name, mode, umask, owner) {
-            Ok(a) => reply.entry(&self.ttl, &a, GEN),
-            Err(e) => reply.error(err(e)),
-        }
+        self.entry(
+            reply,
+            self.core.mknod(parent.0, name, mode, caller(owner, umask)),
+        );
     }
 
     fn mkdir(
@@ -152,24 +210,18 @@ impl Filesystem for CoffeeFs {
         owner: Owner,
         reply: ReplyEntry,
     ) {
-        match self.core.mkdir(parent.0, name, mode, umask, owner) {
-            Ok(a) => reply.entry(&self.ttl, &a, GEN),
-            Err(e) => reply.error(err(e)),
-        }
+        self.entry(
+            reply,
+            self.core.mkdir(parent.0, name, mode, caller(owner, umask)),
+        );
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.core.unlink(parent.0, name) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.unlink(parent.0, name));
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.core.rmdir(parent.0, name) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.rmdir(parent.0, name));
     }
 
     fn symlink(
@@ -181,10 +233,11 @@ impl Filesystem for CoffeeFs {
         owner: Owner,
         reply: ReplyEntry,
     ) {
-        match self.core.symlink(parent.0, link_name, target, owner) {
-            Ok(a) => reply.entry(&self.ttl, &a, GEN),
-            Err(e) => reply.error(err(e)),
-        }
+        self.entry(
+            reply,
+            self.core
+                .symlink(parent.0, link_name, target, caller(owner, 0)),
+        );
     }
 
     fn rename(
@@ -198,13 +251,10 @@ impl Filesystem for CoffeeFs {
         _owner: Option<Owner>,
         reply: ReplyEmpty,
     ) {
-        match self
+        let r = self
             .core
-            .rename(parent.0, name, newparent.0, newname, flags.bits())
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+            .rename((parent.0, name), (newparent.0, newname), flags.bits());
+        empty(reply, r);
     }
 
     fn link(
@@ -215,10 +265,7 @@ impl Filesystem for CoffeeFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        match self.core.link(ino.0, newparent.0, newname) {
-            Ok(a) => reply.entry(&self.ttl, &a, GEN),
-            Err(e) => reply.error(err(e)),
-        }
+        self.entry(reply, self.core.link(ino.0, newparent.0, newname));
     }
 
     fn open(
@@ -229,10 +276,7 @@ impl Filesystem for CoffeeFs {
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        match self.core.open(ino.0, flags.0) {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-            Err(e) => reply.error(err(e)),
-        }
+        opened(reply, self.core.open(ino.0, flags.0));
     }
 
     fn read(
@@ -246,10 +290,7 @@ impl Filesystem for CoffeeFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.core.read(fh.0, offset, size) {
-            Ok(v) => reply.data(&v),
-            Err(e) => reply.error(err(e)),
-        }
+        data(reply, self.core.read(fh.0, offset, size));
     }
 
     fn write(
@@ -264,10 +305,9 @@ impl Filesystem for CoffeeFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.core.write(fh.0, offset, data) {
-            Ok(n) => reply.written(n),
-            Err(e) => reply.error(err(e)),
-        }
+        send(reply, self.core.write(fh.0, offset, data), |r, n| {
+            r.written(n);
+        });
     }
 
     fn flush(
@@ -303,17 +343,11 @@ impl Filesystem for CoffeeFs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.core.fsync(fh.0, datasync) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.fsync(fh.0, datasync));
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.core.opendir(ino.0) {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-            Err(e) => reply.error(err(e)),
-        }
+        opened(reply, self.core.opendir(ino.0));
     }
 
     fn readdir(
@@ -327,10 +361,7 @@ impl Filesystem for CoffeeFs {
         let r = self.core.readdir(fh.0, offset, |ino, off, kind, name| {
             reply.add(INodeNo(ino), off, kind, name)
         });
-        match r {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        send(reply, r, |r, ()| r.ok());
     }
 
     fn releasedir(
@@ -348,21 +379,20 @@ impl Filesystem for CoffeeFs {
     fn fsyncdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
-        _datasync: bool,
+        datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        empty(reply, self.core.fsyncdir(ino.0, datasync));
     }
 
     fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
-        match self.core.statfs(ino.0) {
-            Ok(s) => reply.statfs(
+        send(reply, self.core.statfs(ino.0), |r, s| {
+            r.statfs(
                 s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
-            ),
-            Err(e) => reply.error(err(e)),
-        }
+            );
+        });
     }
 
     fn setxattr(
@@ -375,25 +405,19 @@ impl Filesystem for CoffeeFs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        match self.core.setxattr(ino.0, name, value, flags) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.setxattr(ino.0, name, value, flags));
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        xattr_reply(self.core.getxattr(ino.0, name), size, reply);
+        xattr(reply, self.core.getxattr(ino.0, name), size);
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        xattr_reply(self.core.listxattr(ino.0), size, reply);
+        xattr(reply, self.core.listxattr(ino.0), size);
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.core.removexattr(ino.0, name) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.removexattr(ino.0, name));
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
@@ -413,10 +437,12 @@ impl Filesystem for CoffeeFs {
         owner: Owner,
         reply: ReplyCreate,
     ) {
-        match self.core.create(parent.0, name, mode, umask, flags, owner) {
-            Ok((a, fh)) => reply.created(&self.ttl, &a, GEN, FileHandle(fh), FopenFlags::empty()),
-            Err(e) => reply.error(err(e)),
-        }
+        let r = self
+            .core
+            .create(parent.0, name, mode, flags, caller(owner, umask));
+        send(reply, r, |r, (a, fh)| {
+            r.created(&self.ttl, &a, GEN, FileHandle(fh), FopenFlags::empty());
+        });
     }
 
     fn fallocate(
@@ -429,10 +455,7 @@ impl Filesystem for CoffeeFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        match self.core.fallocate(fh.0, offset, length, mode) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(err(e)),
-        }
+        empty(reply, self.core.fallocate(fh.0, offset, length, mode));
     }
 
     fn lseek(
@@ -444,10 +467,9 @@ impl Filesystem for CoffeeFs {
         whence: i32,
         reply: ReplyLseek,
     ) {
-        match self.core.lseek(fh.0, offset, whence) {
-            Ok(o) => reply.offset(o),
-            Err(e) => reply.error(err(e)),
-        }
+        send(reply, self.core.lseek(fh.0, offset, whence), |r, o| {
+            r.offset(o);
+        });
     }
 
     fn copy_file_range(
@@ -463,17 +485,14 @@ impl Filesystem for CoffeeFs {
         flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
-        let len = len.min(u32::MAX as u64);
-        match self.core.copy_file_range(
-            fh_in.0,
-            offset_in,
-            fh_out.0,
-            offset_out,
+        // the reply carries a u32 count
+        let len = len.min(u64::from(u32::MAX));
+        let r = self.core.copy_file_range(
+            (fh_in.0, offset_in),
+            (fh_out.0, offset_out),
             len,
             flags.bits() as u32,
-        ) {
-            Ok(n) => reply.written(n as u32),
-            Err(e) => reply.error(err(e)),
-        }
+        );
+        send(reply, r, |r, n| r.written(n as u32));
     }
 }

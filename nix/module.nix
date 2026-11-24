@@ -13,7 +13,6 @@ let
     types
     optional
     optionals
-    concatMap
     escapeShellArg
     escapeShellArgs
     ;
@@ -72,7 +71,10 @@ let
         links = mkOption {
           type = types.listOf linkType;
           default = [ ];
-          description = "Links present at startup (more can be added at runtime).";
+          description = ''
+            Links set up on every start (more can be added at runtime). One whose
+            source doesn't exist yet is retried until it does.
+          '';
         };
         dirs = mkOption {
           type = types.listOf types.str;
@@ -82,7 +84,11 @@ let
         persist = mkOption {
           type = types.bool;
           default = true;
-          description = "Keep runtime changes across restarts in /var/lib/coffeefs/NAME.json.";
+          description = ''
+            Keep runtime changes (made over the control socket) across restarts
+            in /var/lib/coffeefs/NAME.json. `links` and `dirs` are applied on
+            every start and never persisted, so removing one here revokes it.
+          '';
         };
         threads = mkOption {
           type = types.ints.positive;
@@ -105,6 +111,19 @@ let
     name: i:
     let
       unit = "container@${i.container}.service";
+      # passed as a file: no quoting or SRC:DST splitting issues
+      configFile = pkgs.writeText "coffeefs-${name}.json" (
+        builtins.toJSON (
+          map (target: {
+            kind = "dir";
+            inherit target;
+          }) i.dirs
+          ++ map (l: {
+            kind = "link";
+            inherit (l) source target ro;
+          }) i.links
+        )
+      );
       args =
         [
           "serve"
@@ -115,19 +134,13 @@ let
           (toString i.threads)
           "--ttl"
           i.ttl
+          "--config"
+          "${configFile}"
         ]
         ++ optionals i.persist [
           "--state"
           "/var/lib/coffeefs/${name}.json"
         ]
-        ++ concatMap (l: [
-          (if l.ro then "--link-ro" else "--link")
-          "${l.source}:${l.target}"
-        ]) i.links
-        ++ concatMap (d: [
-          "--mkdir"
-          d
-        ]) i.dirs
         ++ i.extraArgs;
       bin = "${cfg.package}/bin/coffeefs";
     in
