@@ -80,18 +80,82 @@ builds this argument from paths it doesn't validate (`nix/module.nix:124`).
 (`--link SRC DST`, `num_args = 2`), or split at the last `:` and document that
 targets can't contain `:`. Add an assertion in the module either way.
 
-## Cleanup
+## Cleanup (code climate)
 
-### 10. The virtual-tree walk is implemented three times (low)
+This is a Code Climate-style check of `6fecac6`, against Code Climate's
+default maintainability thresholds:
 
-`add_link` has its own validation walk, `ensure_dirs` has a second one, and
-`remove()` has a third (`src/core.rs:1082-1290`). The "is a link" error text
-is already duplicated. `RealRef` is built by hand in both `get()` and
-`lookup()` (around `src/core.rs:424` and `:492`). After `file()`, five places
-repeat `let Handle::File(f) = &*h else { unreachable!() }`.
+| Check | Limit |
+|---|---|
+| Lines per function | 25 |
+| Lines per file | 250 |
+| Cognitive complexity | 5 |
+| Arguments | 4 |
+| Returns | 4 |
+| Methods | 20 |
+| Nesting | 4 |
 
-**Fix:** a shared `walk(&State, comps)` helper, `From<&Real> for RealRef`,
-and a `file()` that returns the `File` directly.
+Neither Code Climate nor qlty is in nixpkgs, so it was emulated:
+- **Metrics:** `rust-code-analysis-cli`.
+- **Duplication:** `jscpd`.
+- **Lints:** `clippy::pedantic`.
+
+| File | Grade | Why |
+|---|---|---|
+| `core.rs` | **D** | 1193 code lines. `impl Core` has 49 methods, 11 functions are over the complexity limit (max 18) and 13 are over 25 lines (max 95). |
+| `main.rs` | C | `serve` is 161 lines with complexity 12. |
+| `fs.rs` | B | 25 copies of `Err(e) => reply.error(err(e))`. The argument counts and size come from fuser's trait. |
+| `ctl.rs` | B | Just under the file limit. `load`, `serve` and `serve_conn` have complexity 6–7. |
+| `sys.rs`, `mount.rs` | A | |
+| `tests.rs` | C | Long tests and repeated setup. |
+
+There is no nesting over 3 and no condition with more than 3 boolean
+operators. Plain clippy is clean. Pedantic gives 56 warnings in non-test
+code, all style.
+
+`adopt()` and the creation argument lists were flagged too, but #3 has since
+removed `adopt()`.
+
+### 10. The tree walk is implemented three times in `core.rs` (M)
+
+The walk exists in `ensure_dirs`, `add_link` and `remove`, with the "is a
+link" message copied word for word. Virtual and real node construction is
+also copied, and the invalidation pairs are built three times. `ensure_dirs`
+never uses `self` (`clippy::unused_self`).
+
+**Fix:** move one `walk` helper, the node constructors and an attach-and-
+invalidate helper onto `State`. That should take `add_link` from 95 to
+about 40 lines.
+
+### 11. Handle access isn't typed (S)
+
+`let Handle::File(f) = &*h else { unreachable!() }` follows `file()` five
+times. `setxattr`/`removexattr` add two more `unreachable!()`s, because
+`xattr_target` returns an `Option` even for writes (complexity 14). `RealRef`
+is built by hand in both `get()` and `lookup()`.
+
+**Fix:** have `file()` return `Arc<File>`, split `xattr_target` into a read
+version and a write version, and add `From<&Real> for RealRef`.
+
+### 12. `setattr` and `snapshot` are too complex (S)
+
+`setattr` has cognitive complexity 18 and `snapshot` 14.
+
+**Fix:**
+- Split `setattr` into owner, mode, size and times helpers, and take
+  `&SetAttr`.
+- Split `snapshot` into a virtual half and a real half.
+
+### 13. `fs.rs` repeats its reply boilerplate (S)
+
+**Fix:** add a reply helper (a trait over `Res<T>` per reply type) to remove
+about 25 match blocks.
+
+### 14. `main.rs::serve` is 161 lines (M)
+
+**Fix:** split it into resolving paths, pre-populating, mounting and waiting
+for exit. Mounting also contains a duplicate: the `/dev/fuse` and
+`Session::from_fd` lines are repeated for the namespace and host-root cases.
 
 ## Limitations / future work
 
