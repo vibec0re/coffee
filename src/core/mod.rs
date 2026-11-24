@@ -398,6 +398,11 @@ impl Core {
         }
     }
 
+    /// Inodes in the table, and open file/directory handles.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.st().nodes.len(), sys::lock(&self.handles).len())
+    }
+
     #[cfg(test)]
     pub fn inode_count(&self) -> usize {
         self.st().nodes.len()

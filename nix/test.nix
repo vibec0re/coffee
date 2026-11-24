@@ -3,12 +3,12 @@
 #
 #   nix build .#checks.x86_64-linux.vm -L
 self:
-{ ... }:
+{ lib, ... }:
 {
   name = "coffeefs";
 
   nodes.machine =
-    { ... }:
+    { lib, ... }:
     {
       imports = [ self.nixosModules.default ];
       virtualisation.memorySize = 2048;
@@ -52,6 +52,7 @@ self:
         # host mount at /containers/choom1, bind-mounted into the container
         choom1 = {
           container = "choom1";
+          containerPath = "/work";
           links = [
             {
               source = "/srv/shared";
@@ -70,12 +71,22 @@ self:
         };
       };
 
+      # what `nixos-rebuild switch` after editing choom1's links does
+      specialisation.relinked.configuration = {
+        services.coffeefs.instances.choom1 = {
+          links = lib.mkForce [
+            {
+              source = "/srv/shared";
+              target = "/shared2";
+              ro = true;
+            }
+          ];
+          dirs = lib.mkForce [ ];
+        };
+      };
+
       containers.choom1 = {
         autoStart = true;
-        bindMounts."/work" = {
-          hostPath = "/containers/choom1";
-          isReadOnly = false;
-        };
         config = {
           users.users.alice = {
             isNormalUser = true;
@@ -109,6 +120,7 @@ self:
         machine.succeed("coffeefs add plain /srv/shared /s --ro")
         assert machine.succeed("cat /mnt/plain/s/hello.txt").strip() == "hello"
         machine.fail("touch /mnt/plain/s/x")
+        machine.fail("echo x >> /mnt/plain/s/hello.txt")
         machine.fail("touch /mnt/plain/top")
         machine.fail("mkdir /mnt/plain/newdir")
         machine.succeed("coffeefs add plain /srv/rw /rw")
@@ -254,6 +266,47 @@ self:
         machine.succeed("grep -qx topsecret /mnt/plain/rw/escape/secret")  # host view: fine
         assert inside("readlink /work/proj/escape").strip() == "/srv/outside"
         inside_fails("cat /work/proj/escape/secret")  # no /srv/outside in there
+
+    with subtest("kernel passthrough: file I/O bypasses the daemon"):
+        import json
+        def status(inst):
+            return json.loads(machine.succeed(f"coffeefs status {inst} --json"))
+        s0 = status("plain")
+        assert s0["passthrough"], s0
+        machine.succeed("dd if=/dev/urandom of=/srv/rw/big bs=1M count=8 status=none")
+        machine.succeed("cmp /srv/rw/big /mnt/plain/rw/big")
+        machine.succeed("dd if=/dev/urandom of=/mnt/plain/rw/big2 bs=1M count=8 status=none")
+        machine.succeed("cmp /mnt/plain/rw/big2 /srv/rw/big2")
+        s1 = status("plain")
+        assert s1["passthrough_opens"] >= s0["passthrough_opens"] + 3, (s0, s1)
+        assert s1["daemon_reads"] == s0["daemon_reads"], (s0, s1)
+        assert s1["daemon_writes"] == s0["daemon_writes"], (s0, s1)
+        # read-only links stay read-only with passthrough
+        machine.succeed("coffeefs add plain /srv/rw/big /bigro --ro")
+        machine.succeed("cmp /mnt/plain/bigro /srv/rw/big")
+        machine.fail("dd if=/dev/zero of=/mnt/plain/bigro bs=1 count=1 conv=notrunc status=none")
+        # and so does the container's view
+        assert inside("cat /work/shared/hello.txt").strip() == "hello"
+        assert status("choom1")["passthrough_opens"] > 0
+
+    with subtest("changing links in the NixOS config reloads in place"):
+        pid = machine.succeed("systemctl show -p MainPID --value coffeefs-choom1").strip()
+        orig = machine.succeed("readlink -f /run/current-system").strip()
+        machine.succeed("systemctl reload coffeefs-plain")
+        machine.succeed("/run/current-system/specialisation/relinked/bin/switch-to-configuration test")
+        assert machine.succeed("systemctl show -p MainPID --value coffeefs-choom1").strip() == pid
+        machine.succeed("journalctl -u coffeefs-choom1 | grep -q 'SIGHUP: reloading'")
+        # the container's bind mount is the same, live mount
+        inside_fails("test -e /work/shared")
+        inside_fails("test -e /work/empty")
+        assert inside("cat /work/shared2/hello.txt").strip() == "hello"
+        inside("test -d /work/proj")  # runtime links are untouched
+        out = machine.succeed("coffeefs ls choom1")
+        assert "/shared2 -> /srv/shared (ro) [config]" in out, out
+        machine.succeed(f"{orig}/bin/switch-to-configuration test")
+        assert machine.succeed("systemctl show -p MainPID --value coffeefs-choom1").strip() == pid
+        assert inside("cat /work/shared/hello.txt").strip() == "hello"
+        inside_fails("test -e /work/shared2")
 
     with subtest("instance mounted inside the container's mount namespace"):
         machine.succeed("coffeefs add choom1ns /srv/shared /data --ro")

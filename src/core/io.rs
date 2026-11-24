@@ -54,7 +54,7 @@ impl Core {
             .ok_or(libc::EBADF)
     }
 
-    pub(super) fn file(&self, fh: u64) -> Res<Arc<File>> {
+    pub fn file(&self, fh: u64) -> Res<Arc<File>> {
         match self.handle(fh)? {
             Handle::File(f) => Ok(f),
             Handle::Dir(_) => Err(libc::EISDIR),

@@ -19,15 +19,6 @@ only be planted if an admin created that ancestor writable for others.
 then `move_mount` onto an `openat2(RESOLVE_NO_SYMLINKS)` fd. In a foreign
 namespace this also avoids `/proc/self` (which isn't usable after `setns`).
 
-### 16. `rm` removes a live entry and a pending one at the same target (low)
-
-Suppose a runtime entry is pending because it conflicts with a config entry
-at the same target. `rm TARGET` removes both. After a restart the config
-entry comes back, but until then it's gone.
-
-**Fix:** an `rm --pending` flag (or `"pending":true` in the request) that only
-drops the pending entry.
-
 ### 17. `tests.rs` is long (low)
 
 The file is 1055 lines. Ten tests are over 25 lines, and the setup code
@@ -35,6 +26,33 @@ The file is 1055 lines. Ten tests are over 25 lines, and the setup code
 
 **Fix:** a small fixture, `Inst::new(config)`, holding the controller, the
 state path and a host dir, then split the file by area (`core`, `ctl`, `perm`).
+
+### 18. Upgrading a host-mode instance needs a container restart (medium)
+
+Config changes now reload in place, and so do package upgrades, on purpose.
+A restart would leave containers that bind-mount the instance with a dead
+mount. So a new binary only takes effect after
+`systemctl restart coffeefs-X container@X`, and a crash has the same effect
+as that restart.
+
+**Fix:**
+- Keep the `/dev/fuse` fd in systemd's fd store (`FDSTORE=1`,
+  `FileDescriptorStoreMax=`), and on restart pick the connection back up
+  instead of mounting again.
+- The hard part is that the kernel still references the old inode numbers.
+  The inode table, with its `O_PATH` fds, has to survive too, either in the fd
+  store or by mapping inode numbers to file handles (`name_to_handle_at`).
+  Until then, `inContainerNamespace` instances avoid the problem entirely.
+
+### 19. No syscall filter in the unit (low)
+
+The unit has a capability bounding set, `NoNewPrivileges`, `AF_UNIX` only and
+`RestrictNamespaces=mnt`. It has no `SystemCallFilter=`.
+
+**Fix:** `@system-service @mount` plus `setns`, `capset`, `setfsuid` and
+`setfsgid`, then verify in the VM test. A mistake shows up as `SIGSYS`, so
+the test has to exercise every path: namespace mode, passthrough, and
+creation as the caller.
 
 ## Code climate
 
@@ -85,15 +103,12 @@ These are the caveats listed in the README, plus a few design limits.
   `default_permissions`, switch the full credentials (including supplementary
   groups) per request, and let the host kernel check permissions and ACLs as
   the caller.
-- **Restarting a host-mode instance kills the container's bind mount.** The
-  container sees `ENOTCONN` until it restarts. `inContainerNamespace` avoids
-  this. Possible fix: hand the `/dev/fuse` fd to systemd's fd store
-  (`FDSTORE=1`) and pick the session back up on restart.
-- **All I/O goes through the daemon.** Kernel FUSE passthrough (Linux 6.9+,
-  `FUSE_PASSTHROUGH` with backing fds) would let reads and writes skip the
-  daemon.
-- **One `O_PATH` fd per inode the kernel holds.** Very large trees can hit
-  `RLIMIT_NOFILE`. Set `LimitNOFILE` in the module, or switch to file handles
+- **A host-mode daemon that stops kills the container's bind mount** (see
+  #18). Config changes and upgrades no longer restart it.
+- **Metadata still goes through the daemon.** Since passthrough, file data
+  doesn't; lookups, `stat` and `readdir` do, cached for `ttl` seconds.
+- **One `O_PATH` fd per inode the kernel holds.** The module sets
+  `LimitNOFILE=1048576`. For very large trees, switch to file handles
   (`name_to_handle_at`/`open_by_handle_at`) like virtiofsd.
 - **No uid mapping.** Owners are passed through 1:1. That's fine for nspawn
   without user namespaces, but wrong for containers that use
@@ -157,3 +172,24 @@ These are the caveats listed in the README, plus a few design limits.
   25 copied error arms.
 - **#14** `serve` was split into `Instance::resolve`, `config_entries`,
   `mount_session` and `run_until_signal`, in `serve.rs`.
+
+### Shipping
+
+- **#16** `rm --pending` only drops a pending entry, and keeps what is live
+  at the target.
+- **Kernel FUSE passthrough:** open files read, write and mmap directly
+  against the host file. There is one backing id per inode, refcounted
+  across opens, with a fallback to daemon I/O. `coffeefs status` shows the
+  counters. In the VM test, 16 MB of I/O through the mount causes no daemon
+  reads or writes.
+- **Hot reload:** `SIGHUP` (`Type=notify-reload`) applies config changes
+  without remounting. The module installs the config at
+  `/etc/coffeefs/NAME.json`, sets `reloadTriggers`, and makes host-mode
+  instances reload instead of restart. The VM test switches to a
+  specialisation and checks that the daemon PID stays the same, that links
+  change inside the container, and that runtime links stay.
+- **systemd hardening:** a capability bounding set, `NoNewPrivileges`,
+  `AF_UNIX` only, `RestrictNamespaces=mnt`, `MemoryDenyWriteExecute`, and
+  `LimitNOFILE`.
+- **`containerPath`** creates the container's bind mount automatically.
+- **Flake checks:** `package` (with the unit tests), `clippy`, `fmt`, `vm`.

@@ -272,6 +272,35 @@ impl Core {
         })
     }
 
+    /// Undo [`Core::mkdir_virtual`]: the directory becomes implicit again, so
+    /// it stays only while something below it does.
+    pub fn demote_dir(&self, target: &Path) -> Result<Vec<Inval>, String> {
+        let comps = parse_target(target)?;
+        if comps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let empty = {
+            let mut s = self.st();
+            let path = s.walk(&comps)?;
+            if path.len() != comps.len() + 1 {
+                return Ok(Vec::new());
+            }
+            match s.vdir_mut(path[path.len() - 1]) {
+                Some(v) => {
+                    v.implicit = true;
+                    v.children.is_empty()
+                }
+                None => return Ok(Vec::new()),
+            }
+        };
+        // control-plane changes are serialized by the caller, so it's still empty
+        if empty {
+            self.remove(target, false)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// Create an explicit (persistent, not auto-pruned) virtual directory.
     pub fn mkdir_virtual(&self, target: &Path) -> Result<Vec<Inval>, String> {
         let comps = parse_target(target)?;

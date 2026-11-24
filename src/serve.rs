@@ -49,9 +49,8 @@ fn config_entries(a: &ServeArgs) -> Result<Vec<ListEntry>, String> {
     Ok(v)
 }
 
-/// Tell systemd (Type=notify) we're mounted, so units ordered after us —
-/// e.g. a container bind-mounting the mountpoint — see the live filesystem.
-fn sd_notify_ready() {
+/// Send a state change to systemd (`Type=notify` / `notify-reload`).
+fn sd_notify(msg: &str) {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixDatagram;
     let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
@@ -63,14 +62,25 @@ fn sd_notify_ready() {
         if let Some(name) = b.strip_prefix(b"@") {
             use std::os::linux::net::SocketAddrExt;
             let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-            sock.send_to_addr(b"READY=1", &addr)
+            sock.send_to_addr(msg.as_bytes(), &addr)
         } else {
-            sock.send_to(b"READY=1", &path)
+            sock.send_to(msg.as_bytes(), &path)
         }
     })();
     if let Err(e) = r {
         log::warn!("sd_notify: {e}");
     }
+}
+
+fn monotonic_usec() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid pointer to a timespec
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000
+        + u64::try_from(ts.tv_nsec).unwrap_or(0) / 1000
 }
 
 /// Where an instance lives.
@@ -153,10 +163,9 @@ pub fn serve(a: &ServeArgs) -> Result<(), String> {
         None => e.to_string(),
     })?;
 
-    let fs = CoffeeFs {
-        core,
-        ttl: Duration::from_secs_f64(a.ttl.max(0.0)),
-    };
+    let ttl = Duration::from_secs_f64(a.ttl.max(0.0));
+    let fs = CoffeeFs::new(core, ttl, !a.no_passthrough);
+    ctl.set_stats(fs.stats());
     let session = mount_session(fs, &inst, ns.as_ref(), a.threads)?;
     ctl.set_invalidator(Box::new(session.notifier()));
     let ctl = Arc::new(ctl);
@@ -164,7 +173,7 @@ pub fn serve(a: &ServeArgs) -> Result<(), String> {
         let ctl = ctl.clone();
         std::thread::spawn(move || ctl::serve(ctl, listener));
     }
-    ctl::spawn_retry(ctl, Duration::from_secs_f64(a.retry.max(0.1)));
+    ctl::spawn_retry(ctl.clone(), Duration::from_secs_f64(a.retry.max(0.1)));
 
     log::info!(
         "instance {}: mounted at {}{}, control socket {}",
@@ -176,7 +185,18 @@ pub fn serve(a: &ServeArgs) -> Result<(), String> {
             .unwrap_or_default(),
         inst.socket.display()
     );
-    let result = run_until_signal(session, sigs, &inst, ns.as_ref());
+    let reload = || {
+        sd_notify(&format!("RELOADING=1\nMONOTONIC_USEC={}", monotonic_usec()));
+        match config_entries(a) {
+            Ok(config) => {
+                ctl.reload(config);
+                ctl.retry();
+            }
+            Err(e) => log::error!("reload: {e}; keeping the current config"),
+        }
+        sd_notify("READY=1");
+    };
+    let result = run_until_signal(session, sigs, &inst, ns.as_ref(), reload);
     let _ = std::fs::remove_file(&inst.socket);
     result
 }
@@ -226,11 +246,14 @@ enum Event {
     Ended(std::io::Result<()>),
 }
 
+/// Serve until SIGINT/SIGTERM (unmount and exit) or the session ends.
+/// SIGHUP reloads the config.
 fn run_until_signal(
     session: Session<CoffeeFs>,
     sigs: SigSet,
     inst: &Instance,
     ns: Option<&OwnedFd>,
+    reload: impl Fn(),
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     {
@@ -240,24 +263,32 @@ fn run_until_signal(
         });
     }
     std::thread::spawn(move || {
-        if let Ok(sig) = sigs.wait() {
-            let _ = tx.send(Event::Signal(sig));
+        while let Ok(sig) = sigs.wait() {
+            if tx.send(Event::Signal(sig)).is_err() {
+                break;
+            }
         }
     });
-    sd_notify_ready();
+    sd_notify("READY=1");
 
-    match rx.recv() {
-        Ok(Event::Signal(sig)) => {
-            log::info!("{sig}: unmounting");
-            if let Err(e) = mount::detach(ns.map(|n| n.as_fd()), &inst.mountpoint) {
-                log::warn!("unmount {}: {e}", inst.mountpoint.display());
+    loop {
+        match rx.recv() {
+            Ok(Event::Signal(Signal::SIGHUP)) => {
+                log::info!("SIGHUP: reloading the config");
+                reload();
             }
-            // Give the session a moment to wind down; if something in the
-            // container still holds files open, exiting aborts the connection.
-            let _ = rx.recv_timeout(Duration::from_secs(2));
-            Ok(())
+            Ok(Event::Signal(sig)) => {
+                log::info!("{sig}: unmounting");
+                if let Err(e) = mount::detach(ns.map(|n| n.as_fd()), &inst.mountpoint) {
+                    log::warn!("unmount {}: {e}", inst.mountpoint.display());
+                }
+                // Give the session a moment to wind down; if something in the
+                // container still holds files open, exiting aborts the connection.
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                return Ok(());
+            }
+            Ok(Event::Ended(r)) => return r.map_err(|e| format!("session ended: {e}")),
+            Err(_) => return Ok(()),
         }
-        Ok(Event::Ended(r)) => r.map_err(|e| format!("session ended: {e}")),
-        Err(_) => Ok(()),
     }
 }

@@ -1,5 +1,9 @@
 //! fuser glue: translates FUSE requests into `Core` calls.
 
+mod passthrough;
+
+pub use passthrough::{Stats, StatsSnapshot};
+
 use crate::core::{Caller, Core, SetAttr, TimeSpec};
 use crate::sys::Res;
 use fuser::{
@@ -9,14 +13,20 @@ use fuser::{
     ReplyOpen, ReplyStatfs, ReplyStatx, ReplyWrite, ReplyXattr, Request, StatxMask, TimeOrNow,
     WriteFlags,
 };
+use passthrough::Passthrough;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, SystemTime};
 
 pub struct CoffeeFs {
-    pub core: Arc<Core>,
-    pub ttl: Duration,
+    core: Arc<Core>,
+    ttl: Duration,
+    /// Try kernel passthrough (see [`passthrough`]).
+    want_passthrough: bool,
+    pt: Passthrough,
 }
 
 const GEN: Generation = Generation(0);
@@ -64,7 +74,7 @@ fn empty(reply: ReplyEmpty, r: Res<()>) {
 
 fn opened(reply: ReplyOpen, r: Res<u64>) {
     send(reply, r, |r, fh| {
-        r.opened(FileHandle(fh), FopenFlags::empty());
+        r.opened(FileHandle(fh), FopenFlags::empty())
     });
 }
 
@@ -100,6 +110,37 @@ fn time(t: Option<TimeOrNow>) -> Option<TimeSpec> {
 }
 
 impl CoffeeFs {
+    pub fn new(core: Arc<Core>, ttl: Duration, passthrough: bool) -> Self {
+        CoffeeFs {
+            core,
+            ttl,
+            want_passthrough: passthrough,
+            pt: Passthrough::default(),
+        }
+    }
+
+    pub fn stats(&self) -> Arc<Stats> {
+        self.pt.stats.clone()
+    }
+
+    /// The backing id for a new open `fh` of `ino`, if it can use kernel
+    /// passthrough; `open_backing` is the reply's registration call.
+    fn backing(
+        &self,
+        ino: u64,
+        fh: u64,
+        open_backing: impl FnOnce(&File) -> std::io::Result<fuser::BackingId>,
+    ) -> Option<Arc<fuser::BackingId>> {
+        Stats::bump(&self.pt.stats.opens);
+        self.pt.attach(ino, fh, || {
+            let f = self
+                .core
+                .file(fh)
+                .map_err(std::io::Error::from_raw_os_error)?;
+            open_backing(&f)
+        })
+    }
+
     fn entry(&self, reply: ReplyEntry, r: Res<FileAttr>) {
         send(reply, r, |r, a| r.entry(&self.ttl, &a, GEN));
     }
@@ -119,6 +160,17 @@ impl Filesystem for CoffeeFs {
         ] {
             if let Err(e) = config.add_capabilities(cap) {
                 log::debug!("kernel lacks capability {e:?}");
+            }
+        }
+        if self.want_passthrough {
+            if config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok() {
+                // 1: backing files must not be on a stacked fs (overlayfs),
+                // but the container may stack an overlayfs on top of us
+                let _ = config.set_max_stack_depth(1);
+                self.pt.stats.passthrough.store(true, Relaxed);
+                log::info!("kernel passthrough enabled");
+            } else {
+                log::info!("kernel has no FUSE passthrough; all I/O goes through the daemon");
             }
         }
         Ok(())
@@ -276,7 +328,14 @@ impl Filesystem for CoffeeFs {
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        opened(reply, self.core.open(ino.0, flags.0));
+        let fh = match self.core.open(ino.0, flags.0) {
+            Ok(fh) => fh,
+            Err(e) => return reply.fail(e),
+        };
+        match self.backing(ino.0, fh, |f| reply.open_backing(f)) {
+            Some(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
+            None => reply.opened(FileHandle(fh), FopenFlags::empty()),
+        }
     }
 
     fn read(
@@ -290,6 +349,7 @@ impl Filesystem for CoffeeFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        Stats::bump(&self.pt.stats.daemon_reads);
         data(reply, self.core.read(fh.0, offset, size));
     }
 
@@ -305,6 +365,7 @@ impl Filesystem for CoffeeFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        Stats::bump(&self.pt.stats.daemon_writes);
         send(reply, self.core.write(fh.0, offset, data), |r, n| {
             r.written(n);
         });
@@ -332,6 +393,7 @@ impl Filesystem for CoffeeFs {
         reply: ReplyEmpty,
     ) {
         self.core.release(fh.0);
+        self.pt.release(fh.0);
         reply.ok();
     }
 
@@ -437,12 +499,18 @@ impl Filesystem for CoffeeFs {
         owner: Owner,
         reply: ReplyCreate,
     ) {
-        let r = self
+        let (a, fh) = match self
             .core
-            .create(parent.0, name, mode, flags, caller(owner, umask));
-        send(reply, r, |r, (a, fh)| {
-            r.created(&self.ttl, &a, GEN, FileHandle(fh), FopenFlags::empty());
-        });
+            .create(parent.0, name, mode, flags, caller(owner, umask))
+        {
+            Ok(r) => r,
+            Err(e) => return reply.fail(e),
+        };
+        let (ttl, fh_, none) = (&self.ttl, FileHandle(fh), FopenFlags::empty());
+        match self.backing(a.ino.0, fh, |f| reply.open_backing(f)) {
+            Some(id) => reply.created_passthrough(ttl, &a, GEN, fh_, none, &id),
+            None => reply.created(ttl, &a, GEN, fh_, none),
+        }
     }
 
     fn fallocate(

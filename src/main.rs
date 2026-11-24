@@ -51,16 +51,26 @@ enum Cmd {
         /// Remove a virtual directory together with everything below it.
         #[arg(short, long)]
         recursive: bool,
+        /// Only drop a pending entry at TARGET, keeping what is live there.
+        #[arg(long)]
+        pending: bool,
     },
     /// Create an empty virtual directory (e.g. a mountpoint for the container).
     Mkdir { instance: String, target: PathBuf },
-    /// List links and directories.
+    /// List links and directories (with their origin, and why pending).
     Ls {
         instance: String,
         #[arg(long)]
         json: bool,
     },
+    /// Show I/O counters (passthrough vs daemon), inodes, open files, pending.
+    Status {
+        instance: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
+
 #[derive(clap::Args)]
 struct ServeArgs {
     /// Instance name; picks the default socket and mountpoint.
@@ -106,6 +116,10 @@ struct ServeArgs {
     /// weren't there yet, conflicts).
     #[arg(long, default_value_t = 5.0)]
     retry: f64,
+    /// Don't use kernel FUSE passthrough (Linux 6.9+, needs root); all I/O
+    /// then goes through the daemon.
+    #[arg(long)]
+    no_passthrough: bool,
 }
 
 fn socket_dir() -> PathBuf {
@@ -160,9 +174,18 @@ fn main() -> ExitCode {
             instance,
             target,
             recursive,
-        } => client(&instance, Request::Rm { target, recursive }),
+            pending,
+        } => client(
+            &instance,
+            Request::Rm {
+                target,
+                recursive,
+                pending,
+            },
+        ),
         Cmd::Mkdir { instance, target } => client(&instance, Request::Mkdir { target }),
         Cmd::Ls { instance, json } => ls(&instance, json),
+        Cmd::Status { instance, json } => status(&instance, json),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -215,4 +238,31 @@ fn ls_line(e: &Entry) -> String {
         s.push_str(&format!(" [pending: {err}]"));
     }
     s
+}
+
+fn status(instance: &str, json: bool) -> Result<(), String> {
+    let r = ctl::call(&instance_socket(instance), &Request::Status)?;
+    if !r.ok {
+        return Err(r.error.unwrap_or_default());
+    }
+    let s = r.status.unwrap_or_default();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&s).unwrap());
+        return Ok(());
+    }
+    let on = if s.io.passthrough { "on" } else { "off" };
+    println!("passthrough:  {on}");
+    println!(
+        "opens:        {} ({} passthrough)",
+        s.io.opens, s.io.passthrough_opens
+    );
+    println!(
+        "daemon I/O:   {} reads, {} writes",
+        s.io.daemon_reads, s.io.daemon_writes
+    );
+    println!("entries:      {} ({} pending)", s.entries, s.pending);
+    println!("inodes:       {}", s.inodes);
+    println!("open handles: {}", s.open_handles);
+    println!("uptime:       {}s", s.uptime_secs);
+    Ok(())
 }

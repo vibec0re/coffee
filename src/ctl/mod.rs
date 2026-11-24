@@ -21,11 +21,12 @@
 //! and retried periodically until it succeeds or is removed.
 
 use crate::core::{Core, Inval, ListEntry};
+use crate::fs::{Stats, StatsSnapshot};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 mod socket;
 pub use socket::{bind, call, serve};
@@ -45,11 +46,28 @@ pub enum Request {
         target: PathBuf,
         #[serde(default)]
         recursive: bool,
+        /// Only drop pending entries there; leave the live one alone.
+        #[serde(default)]
+        pending: bool,
     },
     Mkdir {
         target: PathBuf,
     },
     Ls,
+    Status,
+}
+
+/// What `status` reports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Status {
+    #[serde(flatten)]
+    pub io: StatsSnapshot,
+    /// Inodes in the table: the tree plus whatever the kernel references.
+    pub inodes: usize,
+    pub open_handles: usize,
+    pub entries: usize,
+    pub pending: usize,
+    pub uptime_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +95,8 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<Entry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
 }
 
 impl Response {
@@ -189,6 +209,8 @@ pub struct Controller {
     state_file: Option<PathBuf>,
     /// Also serializes mutations, so the state file always matches the tree.
     book: Mutex<Book>,
+    stats: Arc<Stats>,
+    started: Instant,
 }
 
 impl Controller {
@@ -198,12 +220,94 @@ impl Controller {
             inval,
             state_file,
             book: Mutex::new(Book::default()),
+            stats: Arc::default(),
+            started: Instant::now(),
         }
     }
 
     /// Swap in the real invalidator once the filesystem is mounted.
     pub fn set_invalidator(&mut self, inval: Box<dyn Invalidator>) {
         self.inval = inval;
+    }
+
+    /// The filesystem's I/O counters, for `status`.
+    pub fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = stats;
+    }
+
+    /// Apply a new config (`SIGHUP`, i.e. `systemctl reload`) without
+    /// remounting. Entries that left the config are removed, if they are
+    /// still as configured; new ones are added (or become pending). Runtime
+    /// entries, open files and the mount itself are untouched.
+    pub fn reload(&self, config: Vec<ListEntry>) {
+        let mut b = self.book();
+        let live = self.core.list();
+        let mut invals = Vec::new();
+        let gone: Vec<ListEntry> = b
+            .config
+            .iter()
+            .filter(|e| !config.contains(e))
+            .cloned()
+            .collect();
+        for e in &gone {
+            b.pending
+                .retain(|p| !(p.origin == Origin::Config && &p.entry == e));
+            if !live.contains(e) {
+                continue;
+            }
+            match self.unapply(e) {
+                Ok(i) => {
+                    log::info!("config: {} removed", e.target().display());
+                    invals.extend(i);
+                }
+                Err(err) => log::warn!("config: removing {}: {err}", e.target().display()),
+            }
+        }
+        let added: Vec<ListEntry> = config
+            .iter()
+            .filter(|e| !b.config.contains(e))
+            .cloned()
+            .collect();
+        for e in added {
+            match self.apply_entry(&e, false) {
+                Ok(i) => {
+                    log::info!("config: {} added", e.target().display());
+                    invals.extend(i);
+                }
+                Err(error) => {
+                    log::warn!("config: {}: {error} (pending)", e.target().display());
+                    b.pending.push(Pending {
+                        entry: e,
+                        origin: Origin::Config,
+                        error,
+                    });
+                }
+            }
+        }
+        b.config = config;
+        self.inval.invalidate(&invals);
+        if let Err(e) = self.save(&b) {
+            log::error!("saving state: {e}");
+        }
+    }
+
+    fn unapply(&self, e: &ListEntry) -> Result<Vec<Inval>, String> {
+        match e {
+            ListEntry::Link { target, .. } => self.core.remove(target, false),
+            ListEntry::Dir { target } => self.core.demote_dir(target),
+        }
+    }
+
+    fn status(&self, b: &Book) -> Status {
+        let (inodes, open_handles) = self.core.counts();
+        Status {
+            io: self.stats.snapshot(),
+            inodes,
+            open_handles,
+            entries: self.core.list().len(),
+            pending: b.pending.len(),
+            uptime_secs: self.started.elapsed().as_secs(),
+        }
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
@@ -300,11 +404,30 @@ impl Controller {
                 .core
                 .mkdir_virtual(target)
                 .inspect(|_| _ = b.drop_pending(target, false)),
-            Request::Rm { target, recursive } => {
+            Request::Status => {
+                return Response {
+                    ok: true,
+                    status: Some(self.status(&b)),
+                    ..Default::default()
+                };
+            }
+            Request::Rm {
+                target,
+                recursive,
+                pending,
+            } => {
                 let dropped = b.drop_pending(target, *recursive);
-                match self.core.remove(target, *recursive) {
-                    Err(_) if dropped > 0 => Ok(Vec::new()),
-                    r => r,
+                if *pending {
+                    if dropped > 0 {
+                        Ok(Vec::new())
+                    } else {
+                        Err(format!("{}: nothing pending there", target.display()))
+                    }
+                } else {
+                    match self.core.remove(target, *recursive) {
+                        Err(_) if dropped > 0 => Ok(Vec::new()),
+                        r => r,
+                    }
                 }
             }
         };

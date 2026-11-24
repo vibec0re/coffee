@@ -732,7 +732,8 @@ fn control_socket_protocol() {
             &sock,
             &Request::Rm {
                 target: "/x".into(),
-                recursive: false
+                recursive: false,
+                pending: false,
             }
         )
         .unwrap()
@@ -1009,6 +1010,7 @@ fn unavailable_sources_stay_pending_and_are_retried() {
     c3.apply(Request::Rm {
         target: "/late".into(),
         recursive: false,
+        pending: false,
     })
     .unwrap();
     assert_eq!(saved(&state), vec![dir("/m")]);
@@ -1052,4 +1054,115 @@ fn fsyncdir_syncs_host_dirs_and_ignores_virtual_ones() {
     c.fsyncdir(ino(&c, "/v"), false).unwrap();
     c.fsyncdir(ino(&c, "/v/p"), true).unwrap();
     c.fsyncdir(ino(&c, "/v/p/sub"), false).unwrap();
+}
+
+fn rm(target: &str, recursive: bool, pending: bool) -> Request {
+    Request::Rm {
+        target: target.into(),
+        recursive,
+        pending,
+    }
+}
+
+fn live(ctl: &Controller) -> Vec<ListEntry> {
+    ls(ctl)
+        .into_iter()
+        .filter(|e| e.pending.is_none())
+        .map(|e| e.entry)
+        .collect()
+}
+
+#[test]
+fn reload_applies_config_changes_and_leaves_runtime_entries_alone() {
+    let (h, h2) = (host(), host());
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    let cr = Arc::new(core());
+    let c = Controller::new(cr.clone(), Box::new(NoInval), Some(state.clone()));
+    c.start(vec![
+        dir("/a"),
+        link("/a/x", h.path()),
+        link("/y", h.path()),
+        dir("/keep"),
+    ])
+    .unwrap();
+    c.apply(Request::Add {
+        source: h.path().into(),
+        target: "/keep/rt".into(),
+        ro: false,
+        replace: false,
+    })
+    .unwrap();
+
+    // /a/x and /keep dropped, /y now points elsewhere, /new added
+    c.reload(vec![
+        dir("/a"),
+        link("/y", h2.path()),
+        link("/new", h.path()),
+    ]);
+    assert_eq!(
+        live(&c),
+        vec![
+            dir("/a"),
+            link("/keep/rt", h.path()),
+            link("/new", h.path()),
+            link("/y", h2.path()),
+        ]
+    );
+    // /keep stays (implicitly) while the runtime link below it does...
+    assert!(walk(&cr, "/keep").is_ok());
+    c.apply(rm("/keep/rt", false, false)).unwrap();
+    // ...and goes with it
+    assert_eq!(walk(&cr, "/keep").err(), Some(libc::ENOENT));
+    assert_eq!(saved(&state), Vec::<ListEntry>::new());
+}
+
+#[test]
+fn reload_unblocks_runtime_entries_the_old_config_was_in_the_way_of() {
+    let h = host();
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    fs::write(&state, serde_json::to_vec(&[link("/c", h.path())]).unwrap()).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+    c.start(vec![dir("/c")]).unwrap();
+    assert_eq!(ls(&c).iter().filter(|e| e.pending.is_some()).count(), 1);
+
+    c.reload(vec![]);
+    c.retry();
+    assert_eq!(live(&c), vec![link("/c", h.path())]);
+    assert!(ls(&c).iter().all(|e| e.pending.is_none()));
+}
+
+#[test]
+fn rm_pending_only_drops_the_pending_entry() {
+    let h = host();
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    fs::write(&state, serde_json::to_vec(&[link("/c", h.path())]).unwrap()).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone()));
+    c.start(vec![dir("/c")]).unwrap();
+
+    c.apply(rm("/c", false, true)).unwrap();
+    assert_eq!(live(&c), vec![dir("/c")]);
+    assert!(ls(&c).iter().all(|e| e.pending.is_none()));
+    let e = c.apply(rm("/c", false, true)).unwrap_err();
+    assert!(e.contains("nothing pending"), "{e}");
+}
+
+#[test]
+fn status_reports_entries_pending_and_inodes() {
+    let h = host();
+    let c = Controller::new(Arc::new(core()), Box::new(NoInval), None);
+    c.start(vec![
+        link("/x", h.path()),
+        link("/gone", &h.path().join("nope")),
+    ])
+    .unwrap();
+    let s = c.handle(Request::Status).status.unwrap();
+    assert_eq!((s.entries, s.pending), (1, 1));
+    assert_eq!(s.inodes, 2); // root + /x
+    assert_eq!(s.open_handles, 0);
+    assert!(!s.io.passthrough);
 }
