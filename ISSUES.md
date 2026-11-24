@@ -1,74 +1,14 @@
 # Issues
 
 Open issues from the code review of `6fecac6`, ordered by severity. Each one
-is confirmed by reading the code. None has been reproduced in the VM test
-yet, and none is covered by a test.
-
-## Security
-
-### 1. State file is world-writable (critical)
-
-`serve()` sets a process-wide `umask(0)` (`src/main.rs:280`) so that it can
-apply each request's umask itself. `Controller::save()` (`src/ctl.rs:148`)
-then writes `NAME.tmp` with `std::fs::write`, which uses mode 0666, and renames
-it over `NAME.json`. The result is `/var/lib/coffeefs/NAME.json` with mode 0666.
-
-**Impact:** any local user can add
-`{"kind":"link","target":"/host","source":"/","ro":false}`. The root daemon
-replays it on the next start, which exposes the host's `/` read-write in the
-container.
-
-**Fix:** don't let the daemon's own files inherit umask 0. Either restore a
-restrictive process umask (`0o077`) and `fchmod` every object created for a
-request to its intended mode, or create every daemon-owned file with an
-explicit mode (`OpenOptions::mode(0o600)`). Add a test that checks the state
-file's mode.
-
-### 2. Mountpoints and their parents are created 0777 (high)
-
-`mount_fuse` (`src/mount.rs:89`) and the unprivileged path (`src/main.rs:347`)
-call `create_dir_all` under the same `umask(0)`. On first start this creates
-`/containers` and `/containers/NAME` world-writable.
-
-**Impact:** a local user can replace `/containers/<other-instance>` with a
-symlink to `/etc` before that instance starts. `clear_stale`, `create_dir_all`
-and `mount(2)` all follow the symlink, so the FUSE fs ends up mounted over
-`/etc`. A local user can also take over mountpoints of instances that haven't
-started yet.
-
-**Fix:** use `DirBuilder::new().recursive(true).mode(0o755)`. Same root cause
-and fix as #1. Also refuse a mountpoint that is a symlink: open it with
-`O_PATH|O_NOFOLLOW`, then mount via `/proc/self/fd/N`, or use the new mount API
-(`move_mount`).
-
-### 3. Ownership of new entries can be stolen through a race (high)
-
-`finish_new` (`src/core.rs:660`) first creates the entry with
-`mkdirat`/`mknodat`/`symlinkat`, then opens it again **by name**, and `adopt()`
-`fchown`s whatever that open returned to the requester.
-
-**Impact:** suppose a container user can write to a linked directory that
-also holds a root-owned file. They loop `mkdir x` against
-`rmdir x; mv root_file x`. When the race lands, the root daemon chowns
-`root_file` to them.
-
-`adopt()` has a related problem: when the chown fails, it cleans up with
-`unlinkat` by name (`src/core.rs:655`). In a sticky directory that could delete
-a file the requester isn't allowed to remove. `create()` is not affected,
-because it gets its fd straight from `O_CREAT|O_EXCL`.
-
-**Fix:** create entries as the caller, the way virtiofsd does: set
-`setresuid`/`setresgid` for the current thread with raw syscalls around the
-`*at()` call. The kernel then sets ownership, setgid inheritance and
-sticky-dir rules itself, and `adopt()` can be removed. A smaller stopgap is to
-`fstat` the reopened fd and refuse anything that isn't the expected type,
-owned by the daemon's euid, with `nlink == 1` (2 for a directory).
+was confirmed by reading the code. Fixed issues keep their numbers and are
+listed at the end.
 
 ## Correctness
 
 ### 4. A link whose source is temporarily missing is lost for good (high)
 
-`load()` skips entries whose source can't be opened (`src/ctl.rs:178`). Any
+`load()` skips entries whose source can't be opened (`src/ctl.rs:211`). Any
 later `save()` writes the state without them. That later save is either the
 startup `--mkdir`/`--link` replay, which `handle()` saves after, or the next
 runtime `add`/`rm`.
@@ -83,7 +23,7 @@ later, or when asked to over the control socket.
 ### 5. A conflict between the config and the state file causes a restart loop (medium)
 
 The state file is loaded first. Then `--mkdir`/`--link` are applied, and
-any error aborts `serve()` (`src/main.rs:295-310`). Combined with
+any error aborts `serve()` (`src/main.rs:296-312`). Combined with
 `Restart=on-failure`, the instance never comes up.
 
 **Examples:**
@@ -110,21 +50,20 @@ and rebuilds, but the container keeps access.
 persist only `runtime` entries. Config entries come from argv on every start.
 `ls` can show which is which.
 
-### 7. A crash during `save()` can leave an empty state file and block startup (medium)
+### 7. A corrupt state file blocks startup (low)
 
-`save()` (`src/ctl.rs:148`) does write, then rename, with no `fsync` of the
-file or the directory. After a power loss, `NAME.json` can be empty or
-truncated. `load()` then fails to parse it, `serve()` exits 1, and systemd
-restart-loops the instance until someone deletes the file.
+`save()` now fsyncs the file and its directory (fixed together with #1), so a
+crash should no longer leave a truncated `NAME.json`. A corrupt file from any
+other cause still makes `load()` fail, `serve()` exit 1, and systemd
+restart-loop the instance until someone deletes the file.
 
-**Fix:** `fsync` the tmp file before the rename and the directory after it.
-Also, on a parse error, move the bad file aside as `NAME.json.corrupt` and
+**Fix:** on a parse error, move the bad file aside as `NAME.json.corrupt` and
 start empty (logged loudly) instead of refusing to start.
 
 ### 8. `fsyncdir` is a no-op (medium)
 
 `fsyncdir` replies OK without doing anything (`src/fs.rs:348`), and
-`Core::fsync` does the same for `Handle::Dir` (`src/core.rs:877`). An
+`Core::fsync` does the same for `Handle::Dir` (`src/core.rs:849`). An
 application that does write, fsync, rename, then fsync on the directory is
 told the rename is durable, but it isn't.
 
@@ -146,7 +85,7 @@ targets can't contain `:`. Add an assertion in the module either way.
 ### 10. The virtual-tree walk is implemented three times (low)
 
 `add_link` has its own validation walk, `ensure_dirs` has a second one, and
-`remove()` has a third (`src/core.rs:1110-1300`). The "is a link" error text
+`remove()` has a third (`src/core.rs:1082-1290`). The "is a link" error text
 is already duplicated. `RealRef` is built by hand in both `get()` and
 `lookup()` (around `src/core.rs:424` and `:492`). After `file()`, five places
 repeat `let Handle::File(f) = &*h else { unreachable!() }`.
@@ -179,3 +118,68 @@ These are the caveats listed in the README, plus a few design limits.
 - **Unix sockets in linked dirs can't be connected to.**
 - **Inode numbers differ from the host's.** A file reached through two links
   shows up as two inodes.
+
+## Fixed
+
+### 1. State file was world-writable (critical)
+
+The daemon ran with a process-wide `umask(0)`, so `save()` created `NAME.json`
+as 0666. Any local user could add a link, and the root daemon would replay it
+on the next start.
+
+**Fixed:**
+- The process umask is now 022. Only FUSE worker threads switch to a private
+  umask of 0, via `unshare(CLONE_FS)`, while they create on behalf of a
+  request.
+- `save()` removes any leftover `NAME.tmp`, then writes a fresh 0600 file with
+  `O_EXCL` (so it never follows a planted symlink), fsyncs it, renames it and
+  fsyncs the directory.
+- `load()` refuses a state file that isn't owned by the daemon's user or that
+  group/others can write, instead of replaying it.
+
+Tests:
+- Unit: `state_file_is_private_and_written_fresh`,
+  `state_file_writable_by_others_is_refused`.
+- VM: "daemon's own files are not world-writable".
+
+### 2. Mountpoints and their parents were created 0777 (high)
+
+This had the same umask root cause as #1.
+
+**Fixed:**
+- `mount::prepare_mountpoint` creates missing dirs as 0755 and refuses a
+  mountpoint that is a symlink.
+- Stale-mount detection uses `lstat`, and lazy unmount passes
+  `UMOUNT_NOFOLLOW`.
+
+**Remaining risk:** symlinks in ancestor directories are still followed. They
+can only be planted if an admin pre-created a writable ancestor. Mounting
+through the new mount API (`fsmount` + `move_mount` onto an
+`openat2(RESOLVE_NO_SYMLINKS)` fd) would close that too.
+
+Tests:
+- Unit: `mountpoints_are_created_0755_and_symlinks_refused`.
+- VM: `/containers` is 755.
+
+### 3. Ownership of new entries could be stolen through a race (high)
+
+The daemon created entries as root, then reopened them **by name** and chowned
+whatever it found.
+
+**Fixed:** `adopt()` is gone. `sys::AsCaller` switches the worker thread's
+fsuid/fsgid to the caller for the creating syscall only: mkdir, mknod,
+symlink, and `O_CREAT` open. It then raises `CAP_DAC_OVERRIDE` in that
+thread, because the kernel already checked access under `default_permissions`
+and the thread lacks the caller's supplementary groups. The host kernel now
+sets owner, group (including setgid inheritance) and mode, so nothing is
+chowned. The name is still re-resolved to register the new inode, but that is
+read-only, the same as a lookup.
+
+This also fixes a side effect of the old approach: `mkdir` with S_ISGID in
+the mode used to set the bit by chmod. Linux ignores it, and so do we now.
+
+Tests:
+- Unit: `created_objects_get_the_requested_mode_whatever_the_process_umask`.
+- VM: "objects are created as the caller, not chowned afterwards". It covers
+  the caller's umask, fifos and symlinks, a supplementary-group-only dir, and
+  setgid inheritance.

@@ -42,7 +42,7 @@ fn in_ns<T: Send>(ns: BorrowedFd<'_>, f: impl FnOnce() -> io::Result<T> + Send) 
 /// Lazy unmount. In our own namespace an unprivileged daemon falls back to
 /// the setuid helper; inside a foreign namespace we're root anyway.
 fn lazy_umount(target: &Path, own_ns: bool) -> io::Result<()> {
-    match nix::mount::umount2(target, MntFlags::MNT_DETACH) {
+    match nix::mount::umount2(target, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW) {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::EPERM) if own_ns => {
             let st = std::process::Command::new("fusermount3")
@@ -63,7 +63,7 @@ fn lazy_umount(target: &Path, own_ns: bool) -> io::Result<()> {
 /// A previous instance that died without unmounting leaves a dead FUSE mount
 /// behind (every access fails with ENOTCONN). Detach it so we can remount.
 fn clear_stale_in(target: &Path, own_ns: bool) -> io::Result<()> {
-    match std::fs::metadata(target) {
+    match std::fs::symlink_metadata(target) {
         Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
             log::warn!("{}: clearing stale mount", target.display());
             lazy_umount(target, own_ns)
@@ -76,6 +76,24 @@ pub fn clear_stale(target: &Path) -> io::Result<()> {
     clear_stale_in(target, true)
 }
 
+/// Create `target` and any missing parents as 0755 (never world-writable:
+/// a writable parent would let anyone swap the mountpoint), and make sure
+/// the final component is a real directory rather than a planted symlink.
+pub fn prepare_mountpoint(target: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(target)?;
+    if !std::fs::symlink_metadata(target)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{}: not a directory (symlink?)", target.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// Mount the FUSE connection `fuse` at `target` in the current namespace
 /// (needs root). Clears a stale mount and creates the directory first.
 fn mount_fuse(target: &Path, fuse: BorrowedFd<'_>, fsname: &str, own_ns: bool) -> io::Result<()> {
@@ -86,7 +104,7 @@ fn mount_fuse(target: &Path, fuse: BorrowedFd<'_>, fsname: &str, own_ns: bool) -
         nix::unistd::getegid(),
     );
     clear_stale_in(target, own_ns)?;
-    std::fs::create_dir_all(target)?;
+    prepare_mountpoint(target)?;
     nix::mount::mount(
         Some(fsname),
         target,

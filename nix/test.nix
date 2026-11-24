@@ -16,12 +16,18 @@ self:
       users.users.alice = {
         isNormalUser = true;
         uid = 1000;
+        extraGroups = [ "team" ];
       };
+      users.groups.team = { };
 
       systemd.tmpfiles.rules = [
         "d /srv/shared 0755 root root -"
         "f /srv/shared/hello.txt 0644 root root - hello"
         "d /srv/rw 1777 root root -"
+        # writable for alice only via a supplementary group
+        "d /srv/rw/team 0770 root team -"
+        # setgid: new entries inherit the group (and dirs the bit)
+        "d /srv/rw/sg 2777 root team -"
       ];
 
       services.coffeefs.instances = {
@@ -101,6 +107,40 @@ self:
         machine.fail("su alice -c 'cat /mnt/plain/rw/rootonly'")
         machine.fail("su alice -c 'rm -f /mnt/plain/rw/rootonly'")  # sticky dir
         machine.succeed("su alice -c 'rm /mnt/plain/rw/alice.txt'")
+
+    with subtest("objects are created as the caller, not chowned afterwards"):
+        def owner(p):
+            return machine.succeed(f"stat -c %U:%G:%a {p}").strip()
+        # the daemon's own umask (022) must not leak into the caller's files
+        machine.succeed("su alice -c 'umask 002; echo x > /mnt/plain/rw/u.txt; mkdir /mnt/plain/rw/udir'")
+        assert owner("/srv/rw/u.txt") == "alice:users:664", owner("/srv/rw/u.txt")
+        assert owner("/srv/rw/udir") == "alice:users:775", owner("/srv/rw/udir")
+        machine.succeed("su alice -c 'mkfifo /mnt/plain/rw/fifo; ln -s nowhere /mnt/plain/rw/sym'")
+        assert owner("/srv/rw/fifo").startswith("alice:users:"), owner("/srv/rw/fifo")
+        assert owner("/srv/rw/sym").startswith("alice:users:"), owner("/srv/rw/sym")
+        # access through a supplementary group the daemon thread doesn't have
+        machine.succeed("su alice -c 'echo t > /mnt/plain/rw/team/t.txt && mkdir /mnt/plain/rw/team/d'")
+        assert owner("/srv/rw/team/t.txt") == "alice:users:644", owner("/srv/rw/team/t.txt")
+        # setgid directory: group and bit are inherited by the kernel
+        machine.succeed("su alice -c 'echo s > /mnt/plain/rw/sg/f && mkdir /mnt/plain/rw/sg/d'")
+        assert owner("/srv/rw/sg/f") == "alice:team:644", owner("/srv/rw/sg/f")
+        assert owner("/srv/rw/sg/d") == "alice:team:2755", owner("/srv/rw/sg/d")
+        # root stays root
+        machine.succeed("echo r > /mnt/plain/rw/root.txt")
+        assert owner("/srv/rw/root.txt") == "root:root:644", owner("/srv/rw/root.txt")
+
+    with subtest("daemon's own files are not world-writable"):
+        assert machine.succeed("stat -c %a /containers").strip() == "755"
+        assert machine.succeed("stat -c %a /var/lib/coffeefs/plain.json").strip() == "600"
+        # a tampered (group/world-writable) state file is refused, not replayed
+        machine.succeed("cp -a /var/lib/coffeefs/plain.json /tmp/plain.json.bak")
+        machine.succeed("chmod 666 /var/lib/coffeefs/plain.json")
+        machine.fail("systemctl restart coffeefs-plain")
+        machine.succeed("journalctl -u coffeefs-plain | grep -q 'refusing a state file'")
+        machine.succeed("cp -a /tmp/plain.json.bak /var/lib/coffeefs/plain.json")
+        machine.succeed("systemctl reset-failed coffeefs-plain; systemctl restart coffeefs-plain")
+        machine.wait_for_unit("coffeefs-plain.service")
+        machine.succeed("grep -qx data /mnt/plain/rw/f")
 
     with subtest("removal invalidates kernel caches, open files survive"):
         machine.succeed("ls /mnt/plain/s >/dev/null")

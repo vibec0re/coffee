@@ -273,11 +273,13 @@ fn serve(a: ServeArgs) -> Result<(), String> {
         .map(mount::open_ns)
         .transpose()
         .map_err(|e| e.to_string())?;
+    // Our own files (state, socket dir, mountpoints) get explicit modes; this
+    // is the backstop. FUSE worker threads switch to a private umask of 0
+    // while creating on behalf of a request (sys::AsCaller).
+    unsafe { libc::umask(0o022) };
+
     let listener =
         ctl::bind(&socket).map_err(|e| format!("control socket {}: {e}", socket.display()))?;
-
-    // We apply the requester's umask ourselves.
-    unsafe { libc::umask(0) };
 
     let euid = nix::unistd::geteuid();
     let owner = Owner {
@@ -344,7 +346,7 @@ fn serve(a: ServeArgs) -> Result<(), String> {
         None => {
             mount::clear_stale(&mountpoint)
                 .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
-            std::fs::create_dir_all(&mountpoint)
+            mount::prepare_mountpoint(&mountpoint)
                 .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
             Session::new(fs, &mountpoint, &config)
         }

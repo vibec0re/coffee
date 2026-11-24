@@ -23,8 +23,25 @@ fn me() -> Owner {
 }
 
 fn core() -> Core {
-    unsafe { libc::umask(0) };
     Core::new(me(), false)
+}
+
+/// Run `f` on a thread with its own fs_struct and the given umask, so a
+/// test can pick a umask without disturbing the tests running next to it.
+fn with_umask<T: Send>(umask: u32, f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+            unsafe { libc::umask(umask) };
+            f()
+        })
+        .join()
+        .unwrap()
+    })
+}
+
+fn mode_of(p: &Path) -> u32 {
+    fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
 }
 
 fn os(s: &str) -> &OsStr {
@@ -755,4 +772,76 @@ fn files_keep_host_ownership() {
     let a = walk(&c, "/p/a.txt").unwrap();
     let md = fs::metadata(h.path().join("a.txt")).unwrap();
     assert_eq!((a.uid, a.gid, a.size), (md.uid(), md.gid(), md.size()));
+}
+
+#[test]
+fn created_objects_get_the_requested_mode_whatever_the_process_umask() {
+    let h = host();
+    let c = core();
+    add(&c, "/p", h.path(), false);
+    let dir = ino(&c, "/p");
+    // a restrictive umask on the calling thread must not leak into objects
+    // created for a request: the kernel already applied the caller's umask
+    with_umask(0o077, || {
+        let (_, fh) = c.create(dir, os("f"), 0o666, 0o002, WR, me()).unwrap();
+        c.release(fh);
+        c.mkdir(dir, os("d"), 0o1775, 0o002, me()).unwrap();
+        c.mknod(dir, os("p"), libc::S_IFIFO | 0o666, 0o022, me())
+            .unwrap();
+    });
+    assert_eq!(mode_of(&h.path().join("f")), 0o664);
+    assert_eq!(mode_of(&h.path().join("d")), 0o1775);
+    assert_eq!(mode_of(&h.path().join("p")), 0o644);
+}
+
+#[test]
+fn state_file_is_private_and_written_fresh() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("s.json");
+    // a leftover (or planted) tmp file must not be reused or followed
+    let victim = dir.path().join("victim");
+    fs::write(&victim, "keep").unwrap();
+    symlink(&victim, dir.path().join("s.tmp")).unwrap();
+    with_umask(0, || {
+        let c = Arc::new(core());
+        Controller::new(c, Box::new(NoInval), Some(state.clone()))
+            .apply(Request::Mkdir {
+                target: "/x".into(),
+            })
+            .unwrap();
+    });
+    assert_eq!(mode_of(&state), 0o600);
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    assert!(!dir.path().join("s.tmp").exists());
+}
+
+#[test]
+fn state_file_writable_by_others_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("s.json");
+    fs::write(&state, r#"[{"kind":"dir","target":"/x"}]"#).unwrap();
+    let load = || Controller::new(Arc::new(core()), Box::new(NoInval), Some(state.clone())).load();
+    for bad in [0o666, 0o620, 0o602] {
+        fs::set_permissions(&state, fs::Permissions::from_mode(bad)).unwrap();
+        let e = load().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{bad:o}");
+    }
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o644)).unwrap();
+    load().unwrap();
+}
+
+#[test]
+fn mountpoints_are_created_0755_and_symlinks_refused() {
+    let dir = TempDir::new().unwrap();
+    let mp = dir.path().join("containers/choom1");
+    with_umask(0, || crate::mount::prepare_mountpoint(&mp)).unwrap();
+    assert_eq!(mode_of(&dir.path().join("containers")), 0o755);
+    assert_eq!(mode_of(&mp), 0o755);
+    // existing dir: fine
+    crate::mount::prepare_mountpoint(&mp).unwrap();
+    // a symlink in its place (pointing at a real dir) is not
+    let evil = dir.path().join("containers/choom2");
+    symlink(dir.path(), &evil).unwrap();
+    let e = crate::mount::prepare_mountpoint(&evil).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory);
 }

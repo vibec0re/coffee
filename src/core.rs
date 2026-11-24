@@ -246,8 +246,8 @@ pub struct Core {
     next_fh: AtomicU64,
     /// Owner reported for virtual directories.
     owner: Owner,
-    /// Give newly created objects to the requesting user (needs root).
-    chown: bool,
+    /// Create objects as the requesting user (needs root): see sys::AsCaller.
+    switch_creds: bool,
     born: SystemTime,
 }
 
@@ -362,7 +362,7 @@ fn join(comps: &[OsString]) -> PathBuf {
 }
 
 impl Core {
-    pub fn new(owner: Owner, chown: bool) -> Core {
+    pub fn new(owner: Owner, switch_creds: bool) -> Core {
         let now = SystemTime::now();
         let mut nodes = HashMap::new();
         nodes.insert(
@@ -387,7 +387,7 @@ impl Core {
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             owner,
-            chown,
+            switch_creds,
             born: now,
         }
     }
@@ -621,52 +621,16 @@ impl Core {
 
     // -------------------------------------------------------- namespace ops
 
-    /// Hand a freshly created object to the requesting user. We create as
-    /// root and chown afterwards; on failure the object is removed again.
-    fn adopt(
-        &self,
-        p: &RealRef,
-        name: &CStr,
-        fd: &OwnedFd,
-        owner: Owner,
-        mode: Option<u32>,
-        dir: bool,
-    ) -> Res<()> {
-        if !self.chown {
-            return Ok(());
-        }
-        let res = (|| {
-            let pst = sys::fstat(p.fd.as_fd())?;
-            // setgid parent: the group was already inherited, keep it
-            let gid = if pst.st_mode & libc::S_ISGID != 0 {
-                u32::MAX
-            } else {
-                owner.gid
-            };
-            sys::fchown(fd.as_fd(), owner.uid, gid)?;
-            if let Some(m) = mode
-                && m & 0o6000 != 0
-            {
-                sys::chmod(&sys::proc_path(fd.as_fd()), m)?;
-            }
-            Ok(())
-        })();
-        if res.is_err() {
-            let _ = sys::unlinkat(p.fd.as_fd(), name, if dir { libc::AT_REMOVEDIR } else { 0 });
-        }
-        res
+    /// Switch this thread to the requester for the creating syscall.
+    fn as_caller(&self, owner: Owner) -> Res<sys::AsCaller> {
+        sys::AsCaller::enter(owner.uid, owner.gid, self.switch_creds)
     }
 
-    fn finish_new(
-        &self,
-        p: &RealRef,
-        name: &CStr,
-        owner: Owner,
-        mode: Option<u32>,
-        dir: bool,
-    ) -> Res<FileAttr> {
+    /// Pick up an object we just created. Resolving the name again can race
+    /// with a rename in the host directory, but then we merely report what
+    /// is there now, exactly as a lookup would; nothing is changed on it.
+    fn finish_new(&self, p: &RealRef, name: &CStr) -> Res<FileAttr> {
         let fd = sys::openat(p.fd.as_fd(), name, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
-        self.adopt(p, name, &fd, owner, mode, dir)?;
         self.register(fd, p.root, p.ro)
     }
 
@@ -681,8 +645,11 @@ impl Core {
         let p = self.wdir(parent)?;
         let c = sys::name(name)?;
         let m = mode & !umask & 0o7777;
-        sys::mkdirat(p.fd.as_fd(), &c, m)?;
-        self.finish_new(&p, &c, owner, Some(m), true)
+        {
+            let _id = self.as_caller(owner)?;
+            sys::mkdirat(p.fd.as_fd(), &c, m)?;
+        }
+        self.finish_new(&p, &c)
     }
 
     pub fn mknod(
@@ -701,15 +668,22 @@ impl Core {
         let p = self.wdir(parent)?;
         let c = sys::name(name)?;
         let m = mode & !umask & 0o7777;
-        sys::mknodat(p.fd.as_fd(), &c, fmt | m)?;
-        self.finish_new(&p, &c, owner, Some(m), false)
+        {
+            let _id = self.as_caller(owner)?;
+            sys::mknodat(p.fd.as_fd(), &c, fmt | m)?;
+        }
+        self.finish_new(&p, &c)
     }
 
     pub fn symlink(&self, parent: u64, name: &OsStr, target: &Path, owner: Owner) -> Res<FileAttr> {
         let p = self.wdir(parent)?;
         let c = sys::name(name)?;
-        sys::symlinkat(&sys::cstring(target.as_os_str())?, p.fd.as_fd(), &c)?;
-        self.finish_new(&p, &c, owner, None, false)
+        let t = sys::cstring(target.as_os_str())?;
+        {
+            let _id = self.as_caller(owner)?;
+            sys::symlinkat(&t, p.fd.as_fd(), &c)?;
+        }
+        self.finish_new(&p, &c)
     }
 
     pub fn unlink(&self, parent: u64, name: &OsStr) -> Res<()> {
@@ -827,18 +801,16 @@ impl Core {
         let c = sys::name(name)?;
         let m = mode & !umask & 0o7777;
         let base = (flags & !Self::OPEN_STRIP) | libc::O_NOFOLLOW;
-        let (file, created) =
+        let file = {
+            let _id = self.as_caller(owner)?;
             match sys::openat(p.fd.as_fd(), &c, base | libc::O_CREAT | libc::O_EXCL, m) {
-                Ok(f) => (f, true),
                 Err(libc::EEXIST) if flags & libc::O_EXCL == 0 => {
-                    (sys::openat(p.fd.as_fd(), &c, base, 0)?, false)
+                    sys::openat(p.fd.as_fd(), &c, base, 0)?
                 }
-                Err(e) => return Err(e),
-            };
+                r => r?,
+            }
+        };
         let pathfd = sys::reopen(file.as_fd(), libc::O_PATH)?;
-        if created {
-            self.adopt(&p, &c, &pathfd, owner, Some(m), false)?;
-        }
         let attr = self.register(pathfd, p.root, p.ro)?;
         let fh = self.new_handle(Handle::File(File::from(file)));
         Ok((attr, fh))

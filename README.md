@@ -140,8 +140,15 @@ linked in, and the design keeps it from reaching beyond that:
   once `rw`: a file can't be hardlinked out of the read-only view into the
   writable one.
 - **Permissions**: the fs is mounted with `default_permissions`, so the kernel
-  checks host modes and owners against the caller. New files are created and
-  then chowned to the requesting user, with the setgid-directory group kept.
+  checks host modes and owners against the caller. New files, dirs, fifos and
+  symlinks are created *as* the caller: the worker thread switches its
+  fsuid/fsgid for that one syscall, so the host kernel sets owner, group
+  (including setgid-directory inheritance) and mode. There is no
+  chown-afterwards step to race.
+- The daemon's own files are private. The state file is 0600 and written
+  fresh on every save. Startup refuses a state file that anyone else can
+  write. Mountpoints and their missing parents are created 0755, and a
+  symlinked mountpoint is refused.
 - Mounts are `nosuid,nodev`. Device nodes can't be created. Only the `user.*`
   xattr namespace passes through, so `trusted.*`, `security.capability` and
   the like are blocked.

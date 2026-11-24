@@ -145,27 +145,60 @@ impl Controller {
         }
     }
 
+    /// Write the state atomically and durably: a fresh 0600 tmp file (never
+    /// one left behind by someone else), fsync, rename, fsync the directory.
     fn save(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
         let Some(path) = &self.state_file else {
             return Ok(());
         };
         let data = serde_json::to_vec_pretty(&self.core.list())?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, path)
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+        std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
     }
 
     /// Replay a state file. Missing file = empty; entries whose source has
     /// vanished are skipped with a warning (and dropped on the next save).
+    ///
+    /// The file decides what the (root) daemon exposes, so refuse one that
+    /// anybody but us could have written.
     pub fn load(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
         let Some(path) = &self.state_file else {
             return Ok(());
         };
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
+        let md = f.metadata()?;
+        if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o022 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing a state file that others can write (owner {}, mode {:o}); \
+                     check its contents, then chown/chmod it to 0600",
+                    md.uid(),
+                    md.mode() & 0o7777
+                ),
+            ));
+        }
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut data)?;
         let entries: Vec<ListEntry> = serde_json::from_slice(&data)?;
         for e in entries {
             let r = match &e {
@@ -250,9 +283,8 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
             .mode(0o700)
             .create(dir)?;
     }
-    // Don't touch the process umask here (it's process-wide and the FUSE
-    // side relies on it being 0). The brief window before chmod is covered
-    // by the SO_PEERCRED check on every connection.
+    // The brief window before chmod is covered by the SO_PEERCRED check on
+    // every connection.
     let l = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(l)
