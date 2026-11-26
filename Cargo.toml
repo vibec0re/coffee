@@ -2,6 +2,9 @@
 name = "coffeefs"
 version = "0.1.0"
 edition = "2024"
+description = "FUSE passthrough filesystem whose contents are linked in at runtime"
+license = "Apache-2.0"
+repository = "https://github.com/vibec0re/coffee"
 
 [dependencies]
 clap = { version = "4.6.9", features = ["derive"] }

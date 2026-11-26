@@ -16,6 +16,8 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "FUSE passthrough filesystem whose contents are linked in at runtime";
+    homepage = "https://github.com/vibec0re/coffee";
+    license = lib.licenses.asl20;
     mainProgram = "coffeefs";
     platforms = lib.platforms.linux;
   };

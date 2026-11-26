@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Evaluate every flake output (packages, checks, module, overlay, devShell)
+  # for all systems without building anything.
+  eval:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix flake check --no-build --all-systems
+
+  # One job per flake check, so each one shows up (and fails) on its own.
+  check:
+    name: ${{ matrix.check }} (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { check: fmt, system: x86_64-linux, runner: ubuntu-24.04 }
+          - { check: clippy, system: x86_64-linux, runner: ubuntu-24.04 }
+          # build + unit tests (checkPhase)
+          - { check: package, system: x86_64-linux, runner: ubuntu-24.04 }
+          - { check: package, system: aarch64-linux, runner: ubuntu-24.04-arm }
+          # NixOS VM: real kernel, nspawn container, passthrough; needs KVM
+          - { check: vm, system: x86_64-linux, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix build -L '.#checks.${{ matrix.system }}.${{ matrix.check }}'

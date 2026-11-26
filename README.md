@@ -1,5 +1,8 @@
 # coffeefs ☕
 
+[![CI](https://github.com/vibec0re/coffee/actions/workflows/ci.yml/badge.svg)](https://github.com/vibec0re/coffee/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Selective file access for containers: a FUSE passthrough filesystem whose
 contents are wired up **at runtime**.
 
@@ -319,3 +322,10 @@ $ nix flake check                                 # + clippy, rustfmt, and the V
 $ nix build .#checks.x86_64-linux.vm -L           # NixOS VM: real kernel, nspawn container,
                                                   # 3 instances, passthrough, config switch
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same flake checks on every push and
+pull request, including the VM test on a KVM-enabled runner.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
