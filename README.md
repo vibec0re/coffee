@@ -69,6 +69,36 @@ Things to know:
   them inside the container. That uid is the same on the host (nspawn without
   user namespaces).
 
+## A root: the default route
+
+By default a choom sees only what is linked in, with a read-only skeleton
+holding it together. Give an instance a **root** instead, and everything no
+link covers falls through to that host directory, typically the choom's own
+home:
+
+```console
+# coffeefs root choom1 /home/annika/choom1     # or: serve --root, NixOS `root`
+# cd ~/code && coffeefs add choom1 ./project   # -> /containers/choom1/project
+# coffeefs ls choom1
+/ -> /home/annika/choom1 (root)
+/project -> /home/annika/code/project
+```
+
+`/containers/choom1` is then the home itself, writable, with the links laid
+over it, so the choom can keep `~/.cache`, dotfiles, and build output there.
+The links work like mounts:
+- **A link covers** whatever the root has under the same name, and can't be
+  removed or renamed from inside (`EBUSY`).
+- **A link further down**, such as `/work/proj`, leaves the rest of the
+  root's `work/` visible next to it.
+- **Renames** work anywhere within the root, but not between the root and a
+  link (`EXDEV`).
+
+`--ro` makes the root read-only, so only read-write links can be written.
+There is one root per instance: change it with `coffeefs root … --replace`,
+or clear it with `coffeefs rm choom1 /`. A root set in the NixOS config wins
+over a runtime one.
+
 ## Model
 
 ```
@@ -85,7 +115,9 @@ Things to know:
   become empty. `mkdir` creates a virtual dir that stays, which is useful as a
   mountpoint.
 - The **virtual skeleton** is read-only from inside (`EROFS`). Only the
-  control socket changes it.
+  control socket changes it. With a [root](#a-root-the-default-route), a
+  virtual directory falls through to the root's directory of the same name,
+  if there is one, and is writable like it.
 - **Below a link** everything passes through: create, write, rename, chmod,
   symlinks, hardlinks, `user.*` xattrs, fallocate, copy_file_range, mmap, and
   so on. `ro` links reject every write with `EROFS`.
@@ -99,12 +131,14 @@ Things to know:
 
 ```
 coffeefs serve  NAME [-m MOUNTPOINT] [-s SOCKET] [--state FILE] [--config FILE]...
+                     [--root DIR | --root-ro DIR]
                      [--link SRC[:DST]]... [--link-ro SRC[:DST]]... [--mkdir DIR]...
                      [--pid PID | --mount-ns NSFILE] [--threads N] [--ttl SECS]
                      [--retry SECS] [--no-passthrough]
 coffeefs add    INSTANCE SOURCE [TARGET] [--ro] [--replace]
 coffeefs rm     INSTANCE TARGET [-r] [--pending]
 coffeefs mkdir  INSTANCE TARGET
+coffeefs root   INSTANCE DIR [--ro] [--replace]
 coffeefs ls     INSTANCE [--json]
 coffeefs status INSTANCE [--json]
 ```
@@ -112,7 +146,9 @@ coffeefs status INSTANCE [--json]
 `INSTANCE` is a name, which resolves to `/run/coffeefs/NAME.sock` (or
 `$XDG_RUNTIME_DIR/coffeefs/` when not root; override with
 `COFFEEFS_SOCKET_DIR`), or a path to a socket. The mountpoint defaults to
-`/containers/NAME`.
+`/containers/NAME`. SOURCE and DIR may be relative to the current directory.
+TARGET defaults to `/NAME`, NAME being SOURCE's last component, so
+`add choom1 ./project` links it at `/project`. `rm INSTANCE /` clears the root.
 
 `SIGHUP` re-reads the `--config` files and applies the difference without
 remounting (`systemctl reload`). `SIGTERM`/`SIGINT` unmount and exit.
@@ -121,17 +157,18 @@ remounting (`systemctl reload`). `SIGTERM`/`SIGINT` unmount and exit.
 
 Entries come from two places, and `ls` says which with a `[config]` tag:
 
-- **Config**: `--config FILE`, `--link`, `--link-ro` and `--mkdir`. These are
+- **Config**: `--config FILE`, `--root`, `--link`, `--link-ro` and `--mkdir`. These are
   declarative. They are set up first on every start (and on reload), and are
   never written to the state file, so taking one out of the config removes it.
-- **Runtime**: `add`, `mkdir` and `rm` over the socket. With `--state FILE`
+- **Runtime**: `add`, `mkdir`, `root` and `rm` over the socket. With `--state FILE`
   they are saved after each change (fresh 0600 file, fsync, rename) and
   replayed after the config at startup.
 
 A `--config` file uses the state file's format:
 
 ```json
-[{"kind":"dir","target":"/tmp"},
+[{"kind":"root","source":"/home/annika/choom1"},
+ {"kind":"dir","target":"/tmp"},
  {"kind":"link","source":"/srv/x","target":"/x","ro":true}]
 ```
 
@@ -176,6 +213,7 @@ The ops:
 - `add {source,target,ro?,replace?}`
 - `rm {target,recursive?,pending?}`
 - `mkdir {target}`
+- `root {source,ro?,replace?}`: clear it with `rm` at `/`
 - `ls`: returns `entries`. Each one is a state-file entry plus `origin`
   (`config` or `runtime`), and for pending ones `pending` (the reason).
 - `status`: returns `status`, with these fields:
@@ -222,7 +260,8 @@ The socket is mode `0600`, and every connection is also checked with
 | `container` | `null` | the NixOS container (nspawn machine) it belongs to |
 | `containerPath` | `null` | host mode: bind-mount into the container here |
 | `inContainerNamespace` | `false` | mount inside the running container instead of on the host |
-| `links`, `dirs` | `[]` | config entries: `{ source, target, ro ? false }`, virtual dirs |
+| `root` | `null` | host dir everything else falls through to: a path, or `{ source, ro }` |
+| `links`, `dirs` | `[]` | config entries: `{ source, target ? "/NAME", ro ? false }`, virtual dirs |
 | `persist` | `true` | keep runtime changes in `/var/lib/coffeefs/NAME.json` |
 | `passthrough` | `true` | kernel FUSE passthrough where available |
 | `threads`, `ttl` | `4`, `"1"` | FUSE workers, kernel cache timeout (s) |
@@ -273,6 +312,10 @@ linked in, and the design keeps it from reaching beyond that:
   A symlink planted in a shared dir (`evil -> /etc`) goes back to the kernel
   as a symlink and resolves in the container's view, never on the host.
   Opening, truncating, chmod-ing or creating through a symlink fails.
+- **The root never leads elsewhere.** It is writable from inside, so a
+  choom can plant `work -> /etc` in it. A virtual `/work` then has no
+  backing at all rather than `/etc`: backings are opened with `O_NOFOLLOW`
+  too.
 - **Links are isolated from each other.** Inodes are keyed per link, so
   `rename` and `link` across links return `EXDEV`, just like separate bind
   mounts. That matters when the same host dir is linked twice, once `ro` and

@@ -6,7 +6,8 @@ use super::{
 };
 use crate::sys::{self, Res};
 use fuser::FileType;
-use std::ffi::OsStr;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -113,9 +114,9 @@ impl Core {
     }
 
     /// Make entries created/renamed/removed in a host directory durable.
-    /// Virtual directories have nothing on disk.
+    /// Virtual directories have nothing on disk, except in their backing.
     pub fn fsyncdir(&self, ino: u64, datasync: bool) -> Res<()> {
-        let NodeRef::Real(r) = self.get(ino)? else {
+        let (NodeRef::Real(r) | NodeRef::Virt(_, Some(r))) = self.get(ino)? else {
             return Ok(());
         };
         let d = File::from(sys::reopen(
@@ -147,7 +148,7 @@ impl Core {
 
     pub fn opendir(&self, ino: u64) -> Res<u64> {
         let src = match self.get(ino)? {
-            NodeRef::Virt(_) => None,
+            NodeRef::Virt(..) => None,
             NodeRef::Real(r) if r.fmt == S_IFDIR => Some(r),
             NodeRef::Real(_) => return Err(libc::ENOTDIR),
         };
@@ -173,7 +174,7 @@ impl Core {
         let mut d = sys::lock(&m);
         if offset == 0 || !d.loaded {
             d.entries = match &d.src {
-                None => self.virtual_entries(d.ino),
+                None => self.virtual_entries(d.ino)?,
                 Some(r) => self.host_entries(d.ino, r)?,
             };
             d.loaded = true;
@@ -187,24 +188,34 @@ impl Core {
         Ok(())
     }
 
-    fn virtual_entries(&self, ino: u64) -> Vec<DirEnt> {
+    /// A virtual directory's children, then whatever its backing holds that
+    /// they don't cover.
+    fn virtual_entries(&self, ino: u64) -> Res<Vec<DirEnt>> {
         let dot = |name: &str, ino| DirEnt {
             ino,
             kind: FileType::Directory,
             name: name.into(),
         };
-        let s = self.st();
         let mut v = vec![dot(".", ino), dot("..", ROOT_INO)];
-        let Some(vd) = s.vdir(ino) else { return v };
-        v.extend(vd.children.iter().map(|(name, &c)| DirEnt {
-            ino: c,
-            kind: match s.nodes.get(&c).map(|n| &n.kind) {
-                Some(Kind::Real(r)) => kind_of(r.fmt),
-                _ => FileType::Directory,
-            },
-            name: name.clone(),
-        }));
-        v
+        let backing = {
+            let s = self.st();
+            let Some(vd) = s.vdir(ino) else { return Ok(v) };
+            v.extend(vd.children.iter().map(|(name, &c)| DirEnt {
+                ino: c,
+                kind: match s.nodes.get(&c).map(|n| &n.kind) {
+                    Some(Kind::Real(r)) => kind_of(r.fmt),
+                    _ => FileType::Directory,
+                },
+                name: name.clone(),
+            }));
+            vd.backing.clone()
+        };
+        if let Some(b) = backing {
+            let covered: HashSet<OsString> = v.iter().map(|e| e.name.clone()).collect();
+            let host = self.host_entries(ino, &b)?;
+            v.extend(host.into_iter().filter(|e| !covered.contains(&e.name)));
+        }
+        Ok(v)
     }
 
     fn host_entries(&self, ino: u64, r: &RealRef) -> Res<Vec<DirEnt>> {

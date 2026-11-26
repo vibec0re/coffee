@@ -29,6 +29,12 @@ self:
         # setgid: new entries inherit the group (and dirs the bit)
         "d /srv/rw/sg 2777 root team -"
         "d /srv/a:b 0755 root root -"
+        # alice's home, the root of the `rooted` instance
+        "d /srv/home 0750 alice users -"
+        "f /srv/home/.bashrc 0644 alice users - rc"
+        "d /srv/home/work 0755 alice users -"
+        "f /srv/home/work/old 0644 alice users - old"
+        "d /srv/proj 0755 alice users -"
       ];
 
       services.coffeefs.instances = {
@@ -61,6 +67,19 @@ self:
             }
           ];
           dirs = [ "/empty" ];
+        };
+
+        # a root: everything but the links falls through to alice's home
+        rooted = {
+          mountpoint = "/mnt/rooted";
+          root = "/srv/home";
+          # no target: at /shared
+          links = [
+            {
+              source = "/srv/shared";
+              ro = true;
+            }
+          ];
         };
 
         # mounted straight into the running container's mount namespace
@@ -102,7 +121,7 @@ self:
 
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("container@choom1.service")
-    for unit in ["plain", "choom1", "choom1ns"]:
+    for unit in ["plain", "choom1", "choom1ns", "rooted"]:
         machine.wait_for_unit(f"coffeefs-{unit}.service")
 
     def inside(cmd):
@@ -307,6 +326,43 @@ self:
         assert machine.succeed("systemctl show -p MainPID --value coffeefs-choom1").strip() == pid
         assert inside("cat /work/shared/hello.txt").strip() == "hello"
         inside_fails("test -e /work/shared2")
+
+    with subtest("root: what no link covers falls through to it"):
+        out = machine.succeed("coffeefs ls rooted")
+        assert "/ -> /srv/home (root) [config]" in out, out
+        assert "/shared -> /srv/shared (ro) [config]" in out, out
+        # / is alice's home: its contents, its owner and mode
+        assert machine.succeed("stat -c %U:%a /mnt/rooted").strip() == "alice:750"
+        machine.succeed("grep -qx rc /mnt/rooted/.bashrc")
+        machine.succeed("grep -qx hello /mnt/rooted/shared/hello.txt")
+        # writes outside the links land in the home, as the caller
+        machine.succeed("su alice -c 'echo x > /mnt/rooted/new && mkdir -p /mnt/rooted/.cache/a'")
+        assert machine.succeed("stat -c %U /srv/home/new").strip() == "alice"
+        machine.succeed("test -d /srv/home/.cache/a")
+        machine.fail("touch /mnt/rooted/shared/x")
+        # relative source, default target; and a link below a home dir that
+        # leaves the rest of it in view
+        machine.succeed("cd /srv && coffeefs add rooted ./proj && coffeefs add rooted ./rw /work/rw")
+        machine.succeed("test -d /mnt/rooted/proj && grep -qx old /mnt/rooted/work/old")
+        machine.succeed("cmp /mnt/rooted/work/rw/f /srv/rw/f")
+        # links can't be removed or renamed from inside, like mountpoints
+        machine.fail("rmdir /mnt/rooted/proj")
+        machine.fail("mv /mnt/rooted/work /mnt/rooted/work2")
+        machine.succeed("test -d /srv/proj && test -d /srv/home/work")
+        # without the root, back to the bare skeleton; a restart brings the
+        # configured one back
+        machine.succeed("coffeefs rm rooted /")
+        machine.fail("test -e /mnt/rooted/.bashrc")
+        assert machine.succeed("stat -c %a /mnt/rooted").strip() == "555"
+        machine.succeed("test -d /mnt/rooted/proj")
+        restart("coffeefs-rooted")
+        machine.succeed("grep -qx rc /mnt/rooted/.bashrc && test -d /mnt/rooted/proj")
+        # one root at a time; --replace swaps it at runtime
+        machine.fail("coffeefs root rooted /srv/shared")
+        machine.succeed("coffeefs root rooted /srv/shared --replace --ro")
+        machine.succeed("grep -qx hello /mnt/rooted/hello.txt")
+        machine.fail("touch /mnt/rooted/x")
+        assert "/ -> /srv/shared (root, ro)" in machine.succeed("coffeefs ls rooted")
 
     with subtest("instance mounted inside the container's mount namespace"):
         machine.succeed("coffeefs add choom1ns /srv/shared /data --ro")

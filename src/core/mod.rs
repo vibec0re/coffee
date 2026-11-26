@@ -8,13 +8,25 @@
 //!   runtime via the control socket) is a real node hanging off a virtual
 //!   directory; everything below a linked directory is passthrough.
 //!
+//! Optionally the tree has a **root**: a host directory that the virtual
+//! directories fall through to, a bit like a default route. `/` is then the
+//! root directory, with the links and virtual directories laid over it. A
+//! virtual directory below `/` falls through to the root's directory of the
+//! same name, if there is one, so a link at `/work/proj` leaves the rest of
+//! the root's `work/` visible next to it. Anything that isn't a link or a
+//! virtual directory is plain passthrough to the root, writes included,
+//! unless the root is read-only. A name in the tree covers the same name in
+//! the root, the way a mount does: it can't be removed or renamed from inside
+//! (`EBUSY`), and what it covers is out of reach until it goes.
+//!
 //! Every real node holds an `O_PATH` fd to its host object. Children are
 //! resolved strictly one component at a time with `openat(O_NOFOLLOW)`, so a
 //! symlink planted inside a shared directory can never make the (root-running)
 //! daemon touch anything outside that directory: symlinks are returned to the
 //! kernel as symlinks and resolved in the *container's* view.
 //!
-//! Each link gets its own "root id". Inodes are keyed by `(root id, dev, ino)`,
+//! Each link gets its own "root id", and so does each root that is set.
+//! Inodes are keyed by `(root id, dev, ino)`,
 //! so the same host file reached via two links is two distinct inodes, and
 //! `rename`/`link` across links fail with `EXDEV` (like separate bind mounts).
 //! That keeps a read-only link from being written through a read-write one.
@@ -73,12 +85,20 @@ pub enum ListEntry {
     Dir {
         target: PathBuf,
     },
+    /// The host directory everything no link or virtual dir covers falls
+    /// through to. Its target is always `/`.
+    Root {
+        source: PathBuf,
+        #[serde(default)]
+        ro: bool,
+    },
 }
 
 impl ListEntry {
     pub fn target(&self) -> &Path {
         match self {
             ListEntry::Link { target, .. } | ListEntry::Dir { target } => target,
+            ListEntry::Root { .. } => Path::new("/"),
         }
     }
 }
@@ -142,16 +162,27 @@ struct VDir {
     /// Created only as a parent of something else; pruned once empty.
     implicit: bool,
     mtime: SystemTime,
+    /// The root's directory at this path, which everything that isn't a
+    /// child falls through to. Resolved when the directory is made (or the
+    /// root is set), one component at a time and never through a symlink.
+    backing: Option<RealRef>,
 }
 
 impl VDir {
-    fn new(implicit: bool) -> VDir {
+    fn new(implicit: bool, backing: Option<RealRef>) -> VDir {
         VDir {
             children: BTreeMap::new(),
             implicit,
             mtime: SystemTime::now(),
+            backing,
         }
     }
+}
+
+/// The root, as it was asked for.
+struct RootSource {
+    source: PathBuf,
+    ro: bool,
 }
 
 struct Real {
@@ -195,7 +226,9 @@ impl From<&Real> for RealRef {
 }
 
 enum NodeRef {
-    Virt(FileAttr),
+    /// A virtual directory: its own attributes, and its backing if it has
+    /// one (whose attributes it then reports instead).
+    Virt(FileAttr, Option<RealRef>),
     Real(RealRef),
 }
 
@@ -204,6 +237,7 @@ struct State {
     by_key: HashMap<(u64, u64, u64), u64>,
     next_ino: u64,
     next_root: u64,
+    root: Option<RootSource>,
 }
 
 #[derive(Clone)]
@@ -244,7 +278,7 @@ impl Core {
             Node {
                 nlookup: 1,
                 pinned: true,
-                kind: Kind::Virt(VDir::new(false)),
+                kind: Kind::Virt(VDir::new(false, None)),
             },
         );
         Core {
@@ -253,6 +287,7 @@ impl Core {
                 by_key: HashMap::new(),
                 next_ino: ROOT_INO + 1,
                 next_root: 1,
+                root: None,
             }),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -295,22 +330,40 @@ impl Core {
         let s = self.st();
         let n = s.nodes.get(&ino).ok_or(libc::ESTALE)?;
         Ok(match &n.kind {
-            Kind::Virt(v) => NodeRef::Virt(self.vattr(&s, ino, v)),
+            Kind::Virt(v) => NodeRef::Virt(self.vattr(&s, ino, v), v.backing.clone()),
             Kind::Real(r) => NodeRef::Real(r.into()),
         })
     }
 
+    /// The host object behind `ino`: a real node's, or a virtual directory's
+    /// backing. `virt_err` for a virtual directory without one.
     fn real(&self, ino: u64, virt_err: i32) -> Res<RealRef> {
         match self.get(ino)? {
-            NodeRef::Virt(_) => Err(virt_err),
+            NodeRef::Virt(_, b) => b.ok_or(virt_err),
             NodeRef::Real(r) => Ok(r),
         }
     }
 
-    /// A directory we may create/remove entries in. The virtual skeleton is
-    /// managed only via the control socket, so it reads as a read-only fs.
-    fn wdir(&self, ino: u64) -> Res<RealRef> {
-        let r = self.real(ino, libc::EROFS)?;
+    /// The host directory in which `name` may be created or removed in
+    /// directory `ino`. The virtual skeleton is managed only via the control
+    /// socket, so a virtual directory reads as read-only, unless it has a
+    /// backing. Even then, a name in the tree (`shadowed`: `EEXIST` to create
+    /// it, `EBUSY` to remove it) stays out of reach, like a mountpoint: the
+    /// operation would otherwise land on the backing's object it covers.
+    fn wdir(&self, ino: u64, name: &OsStr, shadowed: i32) -> Res<RealRef> {
+        let r = {
+            let s = self.st();
+            match &s.nodes.get(&ino).ok_or(libc::ESTALE)?.kind {
+                Kind::Real(r) => RealRef::from(r),
+                Kind::Virt(v) => {
+                    let b = v.backing.clone().ok_or(libc::EROFS)?;
+                    if v.children.contains_key(name) {
+                        return Err(shadowed);
+                    }
+                    b
+                }
+            }
+        };
         if r.fmt != S_IFDIR {
             return Err(libc::ENOTDIR);
         }
@@ -358,11 +411,15 @@ impl Core {
             let mut s = self.st();
             match &s.nodes.get(&parent).ok_or(libc::ESTALE)?.kind {
                 Kind::Real(r) => RealRef::from(r),
-                Kind::Virt(_) => {
-                    let found = self.lookup_virtual(&mut s, parent, name)?;
-                    drop(s);
-                    return found.attr(self);
-                }
+                Kind::Virt(v) => match (v.children.contains_key(name), v.backing.clone()) {
+                    // not in the tree: fall through to the root
+                    (false, Some(b)) => b,
+                    _ => {
+                        let found = self.lookup_virtual(&mut s, parent, name)?;
+                        drop(s);
+                        return found.attr(self);
+                    }
+                },
             }
         };
         if p.fmt != S_IFDIR {
@@ -393,8 +450,10 @@ impl Core {
 
     pub fn getattr(&self, ino: u64) -> Res<FileAttr> {
         match self.get(ino)? {
-            NodeRef::Virt(a) => Ok(a),
-            NodeRef::Real(r) => Ok(stat_attr(ino, &sys::fstat(r.fd.as_fd())?)),
+            NodeRef::Virt(a, None) => Ok(a),
+            NodeRef::Virt(_, Some(r)) | NodeRef::Real(r) => {
+                Ok(stat_attr(ino, &sys::fstat(r.fd.as_fd())?))
+            }
         }
     }
 

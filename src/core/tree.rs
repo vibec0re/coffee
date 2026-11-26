@@ -1,6 +1,9 @@
 //! The virtual skeleton and the control plane that edits it.
 
-use super::{Core, Inval, Kind, ListEntry, Node, ROOT_INO, Real, S_IFMT, State, VDir};
+use super::{
+    Core, Inval, Kind, ListEntry, Node, ROOT_INO, Real, RealRef, RootSource, S_IFDIR, S_IFMT,
+    State, VDir,
+};
 use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, OwnedFd};
@@ -62,6 +65,43 @@ fn open_source(source: &Path) -> Result<(OwnedFd, u32), String> {
     .map_err(err)?;
     let st = sys::fstat(fd.as_fd()).map_err(err)?;
     Ok((fd, st.st_mode & S_IFMT))
+}
+
+/// The directory `name` in backing `b`, if there is one. Never through a
+/// symlink: the root may be writable from inside, and a planted
+/// `work -> /etc` must not become the backing of a virtual `/work`.
+fn sub_backing(b: Option<&RealRef>, name: &OsStr) -> Option<RealRef> {
+    let b = b?;
+    let fd = sys::openat(
+        b.fd.as_fd(),
+        &sys::name(name).ok()?,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        0,
+    )
+    .ok()?;
+    Some(RealRef {
+        fd: Arc::new(fd),
+        root: b.root,
+        ro: b.ro,
+        fmt: S_IFDIR,
+    })
+}
+
+/// Names in host directory `b` (for invalidating what the kernel may have
+/// cached from it). Best effort: an unreadable directory yields none.
+fn dir_names(b: &RealRef) -> Vec<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(fd) = sys::reopen(b.fd.as_fd(), libc::O_RDONLY | libc::O_DIRECTORY) else {
+        return Vec::new();
+    };
+    let Ok(mut dir) = nix::dir::Dir::from_fd(fd) else {
+        return Vec::new();
+    };
+    dir.iter()
+        .filter_map(Result::ok)
+        .map(|e| OsStr::from_bytes(e.file_name().to_bytes()).to_os_string())
+        .filter(|n| n != "." && n != "..")
+        .collect()
 }
 
 impl State {
@@ -192,9 +232,36 @@ impl State {
             .first()
             .map_or_else(Vec::new, |c| entry_invals(cur, c));
         for c in missing {
-            cur = self.attach(cur, c, Kind::Virt(VDir::new(true)));
+            let backing = sub_backing(self.vdir(cur).and_then(|v| v.backing.as_ref()), c);
+            cur = self.attach(cur, c, Kind::Virt(VDir::new(true, backing)));
         }
         Ok((cur, invals))
+    }
+
+    /// Give virtual directory `ino` a new backing (or none), and its virtual
+    /// subdirectories theirs, resolved again by name below it. Collects what
+    /// the kernel must forget: the names it may have looked up in the old
+    /// backing, and the directory's attributes and listing.
+    fn rebase(&mut self, ino: u64, backing: Option<RealRef>, invals: &mut Vec<Inval>) {
+        let Some(v) = self.vdir_mut(ino) else { return };
+        let old = std::mem::replace(&mut v.backing, backing.clone());
+        let children: Vec<(OsString, u64)> =
+            v.children.iter().map(|(n, &c)| (n.clone(), c)).collect();
+        if let Some(old) = &old {
+            invals.extend(
+                dir_names(old)
+                    .into_iter()
+                    .filter(|n| !children.iter().any(|(c, _)| c == n))
+                    .map(|name| Inval::Entry { parent: ino, name }),
+            );
+        }
+        invals.push(Inval::Inode(ino));
+        for (name, c) in children {
+            if self.vdir(c).is_some() {
+                let b = sub_backing(backing.as_ref(), &name);
+                self.rebase(c, b, invals);
+            }
+        }
     }
 
     fn list(&self, ino: u64, path: &mut PathBuf, out: &mut Vec<ListEntry>) {
@@ -233,7 +300,7 @@ impl Core {
     ) -> Result<Vec<Inval>, String> {
         let comps = parse_target(target)?;
         let Some((name, dirs)) = comps.split_last() else {
-            return Err("can't link over the root directory".into());
+            return Err("can't link over the root directory (set a root instead)".into());
         };
         let (fd, fmt) = open_source(source)?;
 
@@ -270,6 +337,51 @@ impl Core {
         } else {
             invals
         })
+    }
+
+    /// Make host directory `source` the root: what no link or virtual
+    /// directory covers falls through to it, at `/` and below.
+    pub fn set_root(&self, source: &Path, ro: bool, replace: bool) -> Result<Vec<Inval>, String> {
+        let (fd, fmt) = open_source(source)?;
+        if fmt != S_IFDIR {
+            return Err(format!("{}: not a directory", source.display()));
+        }
+        let mut s = self.st();
+        if !replace && let Some(old) = &s.root {
+            return Err(format!(
+                "the root is already set (to {})",
+                old.source.display()
+            ));
+        }
+        // a root id of its own, so nothing the old root handed out is reused
+        // for the new one, which may differ in ro
+        let root = s.next_root;
+        s.next_root += 1;
+        let backing = RealRef {
+            fd: Arc::new(fd),
+            root,
+            ro,
+            fmt,
+        };
+        s.root = Some(RootSource {
+            source: source.to_path_buf(),
+            ro,
+        });
+        let mut invals = Vec::new();
+        s.rebase(ROOT_INO, Some(backing), &mut invals);
+        Ok(invals)
+    }
+
+    /// Back to no root. What the kernel still holds from it (open files,
+    /// cwds) keeps working, as after removing a link.
+    pub fn clear_root(&self) -> Result<Vec<Inval>, String> {
+        let mut s = self.st();
+        if s.root.take().is_none() {
+            return Err("/: no root set".into());
+        }
+        let mut invals = Vec::new();
+        s.rebase(ROOT_INO, None, &mut invals);
+        Ok(invals)
     }
 
     /// Undo [`Core::mkdir_virtual`]: the directory becomes implicit again, so
@@ -313,11 +425,11 @@ impl Core {
     }
 
     /// Remove the link or virtual directory at `target`, and any implicit
-    /// parents that are left empty.
+    /// parents that are left empty. At `/`, clear the root.
     pub fn remove(&self, target: &Path, recursive: bool) -> Result<Vec<Inval>, String> {
         let comps = parse_target(target)?;
         let Some((name, dirs)) = comps.split_last() else {
-            return Err("can't remove the root directory".into());
+            return self.clear_root();
         };
         let notfound = || format!("{}: no such entry", target.display());
         let mut s = self.st();
@@ -349,8 +461,16 @@ impl Core {
     }
 
     pub fn list(&self) -> Vec<ListEntry> {
-        let mut out = Vec::new();
-        self.st().list(ROOT_INO, &mut PathBuf::from("/"), &mut out);
+        let s = self.st();
+        let mut out: Vec<ListEntry> = s
+            .root
+            .iter()
+            .map(|r| ListEntry::Root {
+                source: r.source.clone(),
+                ro: r.ro,
+            })
+            .collect();
+        s.list(ROOT_INO, &mut PathBuf::from("/"), &mut out);
         out
     }
 }

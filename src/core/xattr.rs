@@ -14,12 +14,12 @@ fn is_user(name: &[u8]) -> bool {
 }
 
 impl Core {
-    /// Where to read xattrs from. `None`: nothing to read there (virtual
-    /// dirs; symlinks, which can't carry `user.*` and which the /proc
-    /// reopen would follow).
+    /// Where to read xattrs from (a virtual dir's backing, if it has one).
+    /// `None`: nothing to read there (virtual dirs without one; symlinks,
+    /// which can't carry `user.*` and which the /proc reopen would follow).
     fn xattr_src(&self, ino: u64) -> Res<Option<RealRef>> {
         Ok(match self.get(ino)? {
-            NodeRef::Real(r) if r.fmt != S_IFLNK => Some(r),
+            NodeRef::Real(r) | NodeRef::Virt(_, Some(r)) if r.fmt != S_IFLNK => Some(r),
             _ => None,
         })
     }

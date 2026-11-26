@@ -1037,13 +1037,14 @@ fn corrupt_state_file_is_moved_aside() {
 fn link_arguments_split_at_the_last_colon_slash() {
     let l = |s| match crate::serve::parse_link(s, false).unwrap() {
         ListEntry::Link { source, target, .. } => (source, target),
-        ListEntry::Dir { .. } => unreachable!(),
+        _ => unreachable!(),
     };
     let p = PathBuf::from;
-    assert_eq!(l("/srv/a"), (p("/srv/a"), p("/srv/a")));
+    // no target: at /NAME
+    assert_eq!(l("/srv/a"), (p("/srv/a"), p("/a")));
     assert_eq!(l("/srv/a:/x"), (p("/srv/a"), p("/x")));
     assert_eq!(l("/srv/a:b:/x"), (p("/srv/a:b"), p("/x")));
-    assert_eq!(l("/srv/a:b"), (p("/srv/a:b"), p("/srv/a:b")));
+    assert_eq!(l("/srv/a:b"), (p("/srv/a:b"), p("/a:b")));
 }
 
 #[test]
@@ -1165,4 +1166,303 @@ fn status_reports_entries_pending_and_inodes() {
     assert_eq!(s.inodes, 2); // root + /x
     assert_eq!(s.open_handles, 0);
     assert!(!s.io.passthrough);
+}
+
+// ---- root: the directory everything no link covers falls through to ----
+
+fn set_root(c: &Core, r: &Path, ro: bool) -> Vec<Inval> {
+    c.set_root(r, ro, false).unwrap()
+}
+
+/// root layout: host() plus work/old.txt
+fn root_dir() -> TempDir {
+    let r = host();
+    fs::create_dir(r.path().join("work")).unwrap();
+    fs::write(r.path().join("work/old.txt"), "old").unwrap();
+    r
+}
+
+#[test]
+fn root_falls_through_and_links_cover_it() {
+    let (r, l) = (root_dir(), host());
+    fs::write(l.path().join("only-in-link"), "l").unwrap();
+    let c = core();
+    let inv = set_root(&c, r.path(), false);
+    assert!(inv.contains(&Inval::Inode(ROOT_INO)), "{inv:?}");
+
+    // / is the root directory: its entries, its attributes
+    assert_eq!(names(&c, ROOT_INO), [".", "..", "a.txt", "sub", "work"]);
+    assert_eq!(read_all(&c, ino(&c, "/a.txt")), b"hello");
+    assert_eq!(read_all(&c, ino(&c, "/sub/b.txt")), b"bee");
+    let a = c.getattr(ROOT_INO).unwrap();
+    assert_eq!(u32::from(a.perm), mode_of(r.path()));
+    assert_eq!(a.uid, fs::metadata(r.path()).unwrap().uid());
+
+    // a link covers the root's entry of the same name
+    add(&c, "/sub", l.path(), false);
+    assert_eq!(names(&c, ROOT_INO), [".", "..", "a.txt", "sub", "work"]);
+    assert_eq!(
+        names(&c, ino(&c, "/sub")),
+        [".", "..", "a.txt", "only-in-link", "sub"]
+    );
+    assert_eq!(walk(&c, "/sub/b.txt").err(), Some(libc::ENOENT));
+
+    // a link further down leaves the rest of the root's directory visible
+    add(&c, "/work/proj", l.path(), false);
+    let work = ino(&c, "/work");
+    assert_eq!(names(&c, work), [".", "..", "old.txt", "proj"]);
+    assert_eq!(read_all(&c, ino(&c, "/work/old.txt")), b"old");
+    assert_eq!(read_all(&c, ino(&c, "/work/proj/only-in-link")), b"l");
+
+    // writes outside the links land in the root, in / and in /work alike
+    let (_, fh) = c
+        .create(ROOT_INO, os("new.txt"), 0o644, WR, caller(0))
+        .unwrap();
+    c.write(fh, 0, b"new").unwrap();
+    c.release(fh);
+    assert_eq!(fs::read(r.path().join("new.txt")).unwrap(), b"new");
+    c.mkdir(work, os("made"), 0o755, caller(0)).unwrap();
+    assert!(r.path().join("work/made").is_dir());
+    let chmod = SetAttr {
+        mode: Some(0o711),
+        ..Default::default()
+    };
+    c.setattr(work, &chmod, None).unwrap();
+    assert_eq!(mode_of(&r.path().join("work")), 0o711);
+
+    // within the root, renames work across directories; into a link they don't
+    c.rename((ROOT_INO, os("new.txt")), (work, os("new.txt")), 0)
+        .unwrap();
+    assert!(r.path().join("work/new.txt").is_file());
+    let proj = ino(&c, "/work/proj");
+    assert_eq!(
+        c.rename((work, os("new.txt")), (proj, os("x")), 0),
+        Err(libc::EXDEV)
+    );
+
+    // what the tree covers can't be touched from inside: not the link, and
+    // not what is under it in the root
+    assert_eq!(c.rmdir(ROOT_INO, os("sub")), Err(libc::EBUSY));
+    assert_eq!(c.unlink(work, os("proj")), Err(libc::EBUSY));
+    assert_eq!(
+        c.rename((ROOT_INO, os("a.txt")), (ROOT_INO, os("sub")), 0),
+        Err(libc::EBUSY)
+    );
+    assert_eq!(
+        c.rename((ROOT_INO, os("work")), (ROOT_INO, os("w2")), 0),
+        Err(libc::EBUSY)
+    );
+    assert_eq!(
+        c.mkdir(work, os("proj"), 0o755, caller(0)).err(),
+        Some(libc::EEXIST)
+    );
+    assert!(r.path().join("sub/b.txt").is_file());
+
+    // links gone: the root shows through again, and /work is plain passthrough
+    c.remove(Path::new("/sub"), false).unwrap();
+    assert_eq!(read_all(&c, ino(&c, "/sub/b.txt")), b"bee");
+    c.remove(Path::new("/work/proj"), false).unwrap();
+    assert_eq!(
+        names(&c, ino(&c, "/work")),
+        [".", "..", "made", "new.txt", "old.txt"]
+    );
+    c.unlink(ino(&c, "/work"), os("new.txt")).unwrap();
+    assert!(!r.path().join("work/new.txt").exists());
+}
+
+#[test]
+fn root_can_be_read_only_replaced_and_cleared() {
+    let (r, l) = (root_dir(), host());
+    let c = core();
+    add(&c, "/work/proj", l.path(), false);
+    set_root(&c, r.path(), true);
+    // a root set after the links reaches the virtual dirs they made, too
+    let work = ino(&c, "/work");
+    assert_eq!(names(&c, work), [".", "..", "old.txt", "proj"]);
+    assert_eq!(
+        c.list(),
+        vec![
+            ListEntry::Root {
+                source: r.path().into(),
+                ro: true
+            },
+            link("/work/proj", l.path()),
+        ]
+    );
+
+    // read-only: nowhere in the root, but a read-write link still is
+    for parent in [ROOT_INO, work] {
+        assert_eq!(
+            c.create(parent, os("f"), 0o644, WR, caller(0)).err(),
+            Some(libc::EROFS)
+        );
+    }
+    assert_eq!(c.open(ino(&c, "/a.txt"), WR).err(), Some(libc::EROFS));
+    let chmod = SetAttr {
+        mode: Some(0o777),
+        ..Default::default()
+    };
+    assert_eq!(c.setattr(ROOT_INO, &chmod, None).err(), Some(libc::EROFS));
+    let proj = ino(&c, "/work/proj");
+    let (_, fh) = c.create(proj, os("f"), 0o644, WR, caller(0)).unwrap();
+    c.release(fh);
+
+    // one root at a time, unless replaced
+    let e = c.set_root(l.path(), false, false).unwrap_err();
+    assert!(e.contains("already set"), "{e}");
+    c.set_root(r.path(), false, true).unwrap();
+    let (_, fh) = c.create(ROOT_INO, os("f"), 0o644, WR, caller(0)).unwrap();
+    c.release(fh);
+    assert!(r.path().join("f").is_file());
+
+    // clearing it: back to the bare skeleton; open files keep working
+    let fh = c.open(ino(&c, "/a.txt"), RD).unwrap();
+    let inv = c.remove(Path::new("/"), false).unwrap();
+    assert!(
+        inv.contains(&Inval::Entry {
+            parent: ROOT_INO,
+            name: "a.txt".into()
+        }),
+        "{inv:?}"
+    );
+    assert_eq!(c.lookup(ROOT_INO, os("a.txt")), Err(libc::ENOENT));
+    assert_eq!(c.getattr(ROOT_INO).unwrap().perm, 0o555);
+    assert_eq!(names(&c, ino(&c, "/work")), [".", "..", "proj"]);
+    assert_eq!(c.read(fh, 0, 100).unwrap(), b"hello");
+    c.release(fh);
+    assert!(
+        c.remove(Path::new("/"), false)
+            .unwrap_err()
+            .contains("no root")
+    );
+    assert!(c.set_root(&r.path().join("a.txt"), false, false).is_err());
+    assert!(c.add_link(Path::new("/"), r.path(), false, false).is_err());
+}
+
+#[test]
+fn root_symlinks_never_become_backing() {
+    let (r, outside) = (host(), host());
+    symlink(outside.path(), r.path().join("work")).unwrap();
+    let c = core();
+    set_root(&c, r.path(), false);
+    // as an entry it's a symlink, for the container to resolve
+    assert_eq!(walk(&c, "/work").unwrap().kind, FileType::Symlink);
+    // but a virtual /work doesn't fall through to where it points
+    add(&c, "/work/proj", r.path(), false);
+    assert_eq!(names(&c, ino(&c, "/work")), [".", "..", "proj"]);
+    assert_eq!(walk(&c, "/work/a.txt").err(), Some(libc::ENOENT));
+    assert_eq!(
+        c.create(ino(&c, "/work"), os("f"), 0o644, WR, caller(0))
+            .err(),
+        Some(libc::EROFS)
+    );
+}
+
+fn root(source: &Path, ro: bool) -> ListEntry {
+    ListEntry::Root {
+        source: source.into(),
+        ro,
+    }
+}
+
+#[test]
+fn root_in_the_control_plane() {
+    let (r, r2, h) = (root_dir(), host(), host());
+    let d = TempDir::new().unwrap();
+    let state = d.path().join("s.json");
+    let ctl = |config: Vec<ListEntry>| {
+        let cr = Arc::new(core());
+        let c = Controller::new(cr.clone(), Box::new(NoInval), Some(state.clone()));
+        c.start(config).unwrap();
+        (c, cr)
+    };
+
+    // set at runtime: persisted and restored
+    let (c1, _) = ctl(vec![]);
+    c1.apply(Request::Root {
+        source: r.path().into(),
+        ro: false,
+        replace: false,
+    })
+    .unwrap();
+    c1.apply(Request::Add {
+        source: h.path().into(),
+        target: "/proj".into(),
+        ro: false,
+        replace: false,
+    })
+    .unwrap();
+    assert_eq!(
+        saved(&state),
+        vec![root(r.path(), false), link("/proj", h.path())]
+    );
+    let (c2, cr2) = ctl(vec![]);
+    assert_eq!(
+        live(&c2),
+        vec![root(r.path(), false), link("/proj", h.path())]
+    );
+    assert_eq!(read_all(&cr2, ino(&cr2, "/work/old.txt")), b"old");
+
+    // a root in the config wins; the runtime one waits (next to a link
+    // whose source is missing)
+    let missing = link("/later", &h.path().join("missing"));
+    let mut st = saved(&state);
+    st.push(missing.clone());
+    fs::write(&state, serde_json::to_vec(&st).unwrap()).unwrap();
+    let (c3, cr3) = ctl(vec![root(r2.path(), true)]);
+    let pending: Vec<_> = ls(&c3)
+        .into_iter()
+        .filter(|e| e.pending.is_some())
+        .collect();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert_eq!(pending[0].entry, root(r.path(), false));
+    assert_eq!(walk(&cr3, "/work").err(), Some(libc::ENOENT));
+    // rm -r / only means the root: the pending root goes, nothing else
+    c3.apply(rm("/", true, true)).unwrap();
+    assert_eq!(saved(&state), vec![link("/proj", h.path()), missing]);
+
+    // reload swaps the configured root in place
+    c3.reload(vec![root(r.path(), false)]);
+    assert_eq!(live(&c3)[0], root(r.path(), false));
+    assert_eq!(read_all(&cr3, ino(&cr3, "/work/old.txt")), b"old");
+    c3.reload(vec![]);
+    assert_eq!(live(&c3), vec![link("/proj", h.path())]);
+    assert_eq!(walk(&cr3, "/work").err(), Some(libc::ENOENT));
+}
+
+#[test]
+fn root_and_config_arguments() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct A {
+        #[command(flatten)]
+        a: crate::ServeArgs,
+    }
+    let parse = |args: &[&str]| {
+        let a = A::try_parse_from(["x", "box"].iter().chain(args)).unwrap();
+        crate::serve::config_entries(&a.a)
+    };
+    assert_eq!(
+        parse(&["--root-ro", "/srv/r", "--link", "/srv/a"]).unwrap(),
+        vec![
+            root(Path::new("/srv/r"), true),
+            link("/a", Path::new("/srv/a"))
+        ]
+    );
+    let d = TempDir::new().unwrap();
+    let cfg = d.path().join("c.json");
+    fs::write(
+        &cfg,
+        serde_json::to_vec(&[root(Path::new("/srv/x"), false)]).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
+    let e = parse(&["--root", "/srv/r", "--config", cfg.to_str().unwrap()]).unwrap_err();
+    assert!(e.contains("more than one root"), "{e}");
+    assert!(A::try_parse_from(["x", "box", "--root", "/a", "--root-ro", "/b"]).is_err());
+    assert!(crate::default_target(Path::new("/")).is_err());
+    assert_eq!(
+        crate::default_target(Path::new("/home/annika/project")).unwrap(),
+        Path::new("/project")
+    );
 }

@@ -17,20 +17,39 @@ let
     escapeShellArgs
     ;
 
-  linkType = types.submodule {
+  linkType = types.submodule (
+    { config, ... }:
+    {
+      options = {
+        source = mkOption {
+          type = types.str;
+          description = "Host file or directory to expose.";
+        };
+        target = mkOption {
+          type = types.str;
+          default = "/" + baseNameOf config.source;
+          defaultText = lib.literalExpression ''"/" + baseNameOf source'';
+          description = "Absolute path inside the coffeefs mount.";
+        };
+        ro = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Expose read-only.";
+        };
+      };
+    }
+  );
+
+  rootType = types.submodule {
     options = {
       source = mkOption {
         type = types.str;
-        description = "Host file or directory to expose.";
-      };
-      target = mkOption {
-        type = types.str;
-        description = "Absolute path inside the coffeefs mount.";
+        description = "Host directory that everything no link covers falls through to.";
       };
       ro = mkOption {
         type = types.bool;
         default = false;
-        description = "Expose read-only.";
+        description = "Read-only: writes outside read-write links fail with EROFS.";
       };
     };
   };
@@ -66,6 +85,18 @@ let
             (at `mountpoint`, a path inside the container) instead of on the
             host. The instance then starts and stops with the container and
             needs no bind mount; daemon restarts re-mount in place.
+          '';
+        };
+        root = mkOption {
+          type = types.nullOr (types.coercedTo types.str (source: { inherit source; }) rootType);
+          default = null;
+          example = "/home/annika/choom1";
+          description = ''
+            Host directory that everything no link or virtual dir covers falls
+            through to, like a default route: `/` is this directory, with the
+            links laid over it. A path, or `{ source; ro; }`. Null: the tree is
+            a read-only skeleton holding just the links. It can also be set at
+            runtime (`coffeefs root`); one set here wins over that.
           '';
         };
         links = mkOption {
@@ -126,13 +157,18 @@ let
     }
   );
 
-  # Links and dirs, in the state file's format. Installed at a stable path
-  # (/etc/coffeefs/NAME.json) so that changing them only reloads the daemon.
+  # Root, links and dirs, in the state file's format. Installed at a stable
+  # path (/etc/coffeefs/NAME.json) so that changing them only reloads the
+  # daemon.
   configFile =
     name: i:
     pkgs.writeText "coffeefs-${name}.json" (
       builtins.toJSON (
-        map (target: {
+        lib.optional (i.root != null) {
+          kind = "root";
+          inherit (i.root) source ro;
+        }
+        ++ map (target: {
           kind = "dir";
           inherit target;
         }) i.dirs

@@ -129,7 +129,7 @@ impl Core {
     }
 
     pub fn statfs(&self, ino: u64) -> Res<StatFs> {
-        let NodeRef::Real(r) = self.get(ino)? else {
+        let (NodeRef::Real(r) | NodeRef::Virt(_, Some(r))) = self.get(ino)? else {
             return Ok(StatFs {
                 blocks: 0,
                 bfree: 0,

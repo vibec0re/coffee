@@ -6,6 +6,7 @@
 //! {"op":"add","source":"/srv/proj","target":"/work/proj","ro":true}
 //! {"op":"rm","target":"/work/proj"}
 //! {"op":"mkdir","target":"/tmp"}
+//! {"op":"root","source":"/home/annika/choom1"}
 //! {"op":"ls"}
 //! ```
 //!
@@ -52,6 +53,14 @@ pub enum Request {
     },
     Mkdir {
         target: PathBuf,
+    },
+    /// Set the root (clear it with `rm` at `/`).
+    Root {
+        source: PathBuf,
+        #[serde(default)]
+        ro: bool,
+        #[serde(default)]
+        replace: bool,
     },
     Ls,
     Status,
@@ -192,8 +201,10 @@ impl Book {
         }
     }
 
-    /// Forget pending entries at `target` (and below it if `subtree`).
+    /// Forget pending entries at `target` (and below it if `subtree`, except
+    /// at `/`, which only means the root).
     fn drop_pending(&mut self, target: &Path, subtree: bool) -> usize {
+        let subtree = subtree && target.parent().is_some();
         let before = self.pending.len();
         self.pending.retain(|p| {
             let t = p.entry.target();
@@ -295,6 +306,7 @@ impl Controller {
         match e {
             ListEntry::Link { target, .. } => self.core.remove(target, false),
             ListEntry::Dir { target } => self.core.demote_dir(target),
+            ListEntry::Root { .. } => self.core.clear_root(),
         }
     }
 
@@ -320,6 +332,7 @@ impl Controller {
             ListEntry::Link { target, source, ro } => {
                 self.core.add_link(target, source, *ro, replace)
             }
+            ListEntry::Root { source, ro } => self.core.set_root(source, *ro, replace),
         }
     }
 
@@ -404,6 +417,14 @@ impl Controller {
                 .core
                 .mkdir_virtual(target)
                 .inspect(|_| _ = b.drop_pending(target, false)),
+            Request::Root {
+                source,
+                ro,
+                replace,
+            } => self
+                .core
+                .set_root(source, *ro, *replace)
+                .inspect(|_| _ = b.drop_pending(Path::new("/"), false)),
             Request::Status => {
                 return Response {
                     ok: true,

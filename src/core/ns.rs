@@ -34,7 +34,7 @@ impl Core {
         caller: Caller,
         make: impl FnOnce(BorrowedFd<'_>, &CStr) -> Res<()>,
     ) -> Res<FileAttr> {
-        let p = self.wdir(parent)?;
+        let p = self.wdir(parent, name, libc::EEXIST)?;
         let c = sys::name(name)?;
         {
             let _id = self.as_caller(caller)?;
@@ -78,7 +78,7 @@ impl Core {
         flags: i32,
         caller: Caller,
     ) -> Res<(FileAttr, u64)> {
-        let p = self.wdir(parent)?;
+        let p = self.wdir(parent, name, libc::EEXIST)?;
         let c = sys::name(name)?;
         let base = (flags & !OPEN_STRIP) | libc::O_NOFOLLOW;
         let file = {
@@ -98,12 +98,12 @@ impl Core {
     }
 
     pub fn unlink(&self, parent: u64, name: &OsStr) -> Res<()> {
-        let p = self.wdir(parent)?;
+        let p = self.wdir(parent, name, libc::EBUSY)?;
         sys::unlinkat(p.fd.as_fd(), &sys::name(name)?, 0)
     }
 
     pub fn rmdir(&self, parent: u64, name: &OsStr) -> Res<()> {
-        let p = self.wdir(parent)?;
+        let p = self.wdir(parent, name, libc::EBUSY)?;
         sys::unlinkat(p.fd.as_fd(), &sys::name(name)?, libc::AT_REMOVEDIR)
     }
 
@@ -111,8 +111,8 @@ impl Core {
         if flags & libc::RENAME_WHITEOUT != 0 {
             return Err(libc::EINVAL);
         }
-        let p = self.wdir(from.0)?;
-        let np = self.wdir(to.0)?;
+        let p = self.wdir(from.0, from.1, libc::EBUSY)?;
+        let np = self.wdir(to.0, to.1, libc::EBUSY)?;
         if p.root != np.root {
             return Err(libc::EXDEV);
         }
@@ -122,7 +122,7 @@ impl Core {
 
     pub fn link(&self, ino: u64, newparent: u64, newname: &OsStr) -> Res<FileAttr> {
         let src = self.real(ino, libc::EPERM)?;
-        let np = self.wdir(newparent)?;
+        let np = self.wdir(newparent, newname, libc::EEXIST)?;
         if src.root != np.root {
             return Err(libc::EXDEV);
         }

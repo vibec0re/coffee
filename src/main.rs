@@ -28,14 +28,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run an instance: mount the filesystem and serve its control socket.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Link a host file or directory into an instance.
     Add {
         /// Instance name, or path to its control socket.
         instance: String,
-        /// Host path to expose.
+        /// Host path to expose (relative to the current directory is fine).
         source: PathBuf,
-        /// Path inside the filesystem (default: same as SOURCE).
+        /// Path inside the filesystem (default: /NAME, NAME being SOURCE's
+        /// last component).
         target: Option<PathBuf>,
         /// Read-only: writes through this link fail with EROFS.
         #[arg(long)]
@@ -57,6 +58,19 @@ enum Cmd {
     },
     /// Create an empty virtual directory (e.g. a mountpoint for the container).
     Mkdir { instance: String, target: PathBuf },
+    /// Set the root: a host directory that everything no link covers falls
+    /// through to, like a default route. `rm INSTANCE /` clears it.
+    Root {
+        instance: String,
+        /// Host directory (relative to the current directory is fine).
+        source: PathBuf,
+        /// Read-only: writes anywhere outside a read-write link fail with EROFS.
+        #[arg(long)]
+        ro: bool,
+        /// Replace a root that is already set.
+        #[arg(long)]
+        replace: bool,
+    },
     /// List links and directories (with their origin, and why pending).
     Ls {
         instance: String,
@@ -88,8 +102,16 @@ struct ServeArgs {
     /// format (repeatable). Never written to the state file.
     #[arg(long, value_name = "FILE")]
     config: Vec<PathBuf>,
-    /// Like --config: link SRC at DST (default: at SRC). Splits at the last
-    /// ":/", so SRC may contain ':' (repeatable).
+    /// Like --config: the root, a host directory that everything no link
+    /// covers falls through to.
+    #[arg(long, value_name = "DIR", conflicts_with = "root_ro")]
+    root: Option<PathBuf>,
+    /// Like --root, read-only.
+    #[arg(long, value_name = "DIR")]
+    root_ro: Option<PathBuf>,
+    /// Like --config: link SRC at DST (default: at /NAME, NAME being SRC's
+    /// last component). Splits at the last ":/", so SRC may contain ':'
+    /// (repeatable).
     #[arg(long, value_name = "SRC[:DST]")]
     link: Vec<String>,
     /// Like --link, read-only (repeatable).
@@ -147,6 +169,15 @@ fn absolute(p: &Path) -> Result<PathBuf, String> {
     std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// Where a link goes when no target is given: `/NAME`, NAME being the
+/// source's last component, so `add box ./project` gives `/project`.
+fn default_target(source: &Path) -> Result<PathBuf, String> {
+    source
+        .file_name()
+        .map(|n| Path::new("/").join(n))
+        .ok_or_else(|| format!("{}: no name to link it at; give a target", source.display()))
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
@@ -159,7 +190,10 @@ fn main() -> ExitCode {
             ro,
             replace,
         } => absolute(&source).and_then(|source| {
-            let target = target.unwrap_or_else(|| source.clone());
+            let target = match target {
+                Some(t) => t,
+                None => default_target(&source)?,
+            };
             client(
                 &instance,
                 Request::Add {
@@ -184,6 +218,21 @@ fn main() -> ExitCode {
             },
         ),
         Cmd::Mkdir { instance, target } => client(&instance, Request::Mkdir { target }),
+        Cmd::Root {
+            instance,
+            source,
+            ro,
+            replace,
+        } => absolute(&source).and_then(|source| {
+            client(
+                &instance,
+                Request::Root {
+                    source,
+                    ro,
+                    replace,
+                },
+            )
+        }),
         Cmd::Ls { instance, json } => ls(&instance, json),
         Cmd::Status { instance, json } => status(&instance, json),
     };
@@ -229,6 +278,11 @@ fn ls_line(e: &Entry) -> String {
             target.display(),
             source.display(),
             if *ro { " (ro)" } else { "" }
+        ),
+        ListEntry::Root { source, ro } => format!(
+            "/ -> {} (root{})",
+            source.display(),
+            if *ro { ", ro" } else { "" }
         ),
     };
     if e.origin == Origin::Config {

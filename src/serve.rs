@@ -3,7 +3,7 @@
 use crate::core::{self, Core, ListEntry};
 use crate::ctl::{self, Controller, NoInval};
 use crate::fs::CoffeeFs;
-use crate::{ServeArgs, absolute, instance_socket, mount, sys};
+use crate::{ServeArgs, absolute, default_target, instance_socket, mount, sys};
 use fuser::{Config, MountOption, Owner, Session, SessionACL};
 use nix::sys::signal::{SigSet, Signal};
 use std::os::fd::{AsFd, OwnedFd};
@@ -19,17 +19,32 @@ pub(crate) fn parse_link(s: &str, ro: bool) -> Result<ListEntry, String> {
         None => (s, None),
     };
     let source = absolute(Path::new(src))?;
-    let target = dst.map_or_else(|| source.clone(), PathBuf::from);
+    let target = match dst {
+        Some(d) => PathBuf::from(d),
+        None => default_target(&source)?,
+    };
     Ok(ListEntry::Link { target, source, ro })
 }
 
 /// Everything the command line asks for on every start. Malformed entries
 /// are an admin error and fail startup; ones that merely can't be applied
 /// yet become pending later.
-fn config_entries(a: &ServeArgs) -> Result<Vec<ListEntry>, String> {
+pub(crate) fn config_entries(a: &ServeArgs) -> Result<Vec<ListEntry>, String> {
     let mut v = Vec::new();
     for c in &a.config {
         v.extend(ctl::read_entries(c).map_err(|e| format!("config {}: {e}", c.display()))?);
+    }
+    if let Some(r) = &a.root {
+        v.push(ListEntry::Root {
+            source: absolute(r)?,
+            ro: false,
+        });
+    }
+    if let Some(r) = &a.root_ro {
+        v.push(ListEntry::Root {
+            source: absolute(r)?,
+            ro: true,
+        });
     }
     v.extend(a.mkdir.iter().map(|d| ListEntry::Dir { target: d.clone() }));
     for l in &a.link {
@@ -38,13 +53,19 @@ fn config_entries(a: &ServeArgs) -> Result<Vec<ListEntry>, String> {
     for l in &a.link_ro {
         v.push(parse_link(l, true)?);
     }
+    let mut roots = 0;
     for e in &v {
         core::parse_target(e.target())?;
-        if let ListEntry::Link { source, .. } = e
-            && !source.is_absolute()
-        {
+        let (ListEntry::Link { source, .. } | ListEntry::Root { source, .. }) = e else {
+            continue;
+        };
+        if !source.is_absolute() {
             return Err(format!("{}: source must be absolute", source.display()));
         }
+        roots += usize::from(matches!(e, ListEntry::Root { .. }));
+    }
+    if roots > 1 {
+        return Err("more than one root in the config".into());
     }
     Ok(v)
 }
